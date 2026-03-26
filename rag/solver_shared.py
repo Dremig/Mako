@@ -56,6 +56,30 @@ NOISE_PATTERNS = [
     re.compile(r"^Error while loading conda entry point:", re.IGNORECASE),
     re.compile(r"typing_extensions", re.IGNORECASE),
 ]
+ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
+    "build_jsp_war": {
+        "script": "$PROJECT_ROOT/scripts/build_jsp_war.py",
+        "required": ["out", "target_file"],
+        "arg_map": {
+            "out": "--out",
+            "target_file": "--target-file",
+            "jsp_name": "--jsp-name",
+        },
+    },
+    "tomcat_manager_read_file": {
+        "script": "$PROJECT_ROOT/scripts/tomcat_manager_read_file.py",
+        "required": ["base_url", "username", "password", "target_file", "artifact_dir"],
+        "arg_map": {
+            "base_url": "--base-url",
+            "username": "--username",
+            "password": "--password",
+            "target_file": "--target-file",
+            "artifact_dir": "--artifact-dir",
+            "app_name": "--app-name",
+            "jsp_name": "--jsp-name",
+        },
+    },
+}
 
 
 class MemoryStore:
@@ -209,6 +233,87 @@ def validate_command(cmd: str) -> str:
         if token in lower:
             raise RuntimeError(f"Blocked potentially destructive command token: {token}")
     return command
+
+
+def available_action_names() -> list[str]:
+    return sorted(ACTION_SCHEMAS.keys())
+
+
+def available_actions_summary() -> str:
+    rows: list[str] = []
+    for name in available_action_names():
+        spec = ACTION_SCHEMAS[name]
+        rows.append(f"{name}: required={','.join(spec['required'])}")
+    return "\n".join(rows) if rows else "none"
+
+
+def action_defaults(name: str, memory: MemoryStore) -> dict[str, str]:
+    if name == "build_jsp_war":
+        artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
+        target_file = memory.get_fact("target.file") or ""
+        return {
+            "out": str(Path(artifact_dir) / "readfile.war"),
+            "target_file": target_file,
+            "jsp_name": "read.jsp",
+        }
+    if name == "tomcat_manager_read_file":
+        target = memory.get_fact("target") or "$TARGET_URL"
+        artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
+        target_file = memory.get_fact("target.file") or ""
+        creds = memory.get_fact("tomcat.creds") or ""
+        username = ""
+        password = ""
+        if ":" in creds:
+            username, password = creds.split(":", 1)
+        return {
+            "base_url": target.rstrip("/"),
+            "username": username,
+            "password": password,
+            "target_file": target_file,
+            "artifact_dir": artifact_dir,
+            "app_name": "readfile",
+            "jsp_name": "read.jsp",
+        }
+    return {}
+
+
+def normalize_action_spec(raw: dict[str, Any], memory: MemoryStore) -> dict[str, Any]:
+    name = str(raw.get("name", "")).strip()
+    if name not in ACTION_SCHEMAS:
+        raise RuntimeError(f"Unknown action: {name}")
+    args = raw.get("args", {})
+    if not isinstance(args, dict):
+        args = {}
+    normalized: dict[str, str] = {}
+    defaults = action_defaults(name, memory)
+    for key, value in {**defaults, **args}.items():
+        text = str(value).strip()
+        if text:
+            normalized[key] = text
+    raw["name"] = name
+    raw["args"] = normalized
+    return raw
+
+
+def validate_action_spec(raw: dict[str, Any], memory: MemoryStore) -> dict[str, Any]:
+    spec = normalize_action_spec(raw, memory)
+    schema = ACTION_SCHEMAS[spec["name"]]
+    missing = [key for key in schema["required"] if not spec["args"].get(key, "").strip()]
+    if missing:
+        raise RuntimeError(f"Action {spec['name']} missing required args: {', '.join(missing)}")
+    return spec
+
+
+def compile_action_command(action: dict[str, Any], memory: MemoryStore) -> str:
+    spec = validate_action_spec(action, memory)
+    schema = ACTION_SCHEMAS[spec["name"]]
+    parts = ["python3", shlex.quote(schema["script"])]
+    for key, flag in schema["arg_map"].items():
+        value = spec["args"].get(key, "").strip()
+        if value:
+            parts.append(flag)
+            parts.append(shlex.quote(value))
+    return " ".join(parts)
 
 
 def repair_helper_command(command: str, memory: MemoryStore) -> str:

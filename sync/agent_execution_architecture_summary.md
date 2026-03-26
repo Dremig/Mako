@@ -122,7 +122,13 @@ This round added practical steps in that direction:
   - flag alias normalization
   - auto-filling missing values from memory
 
-This is not yet a full structured-action architecture, but it is the first useful step away from raw shell-only execution.
+This is not yet a full structured-action architecture, but it is now beyond pure prompt advice:
+
+- a first version of structured helper actions exists
+- helper invocations can be normalized and auto-completed from memory
+- action specs can be validated before command execution
+
+The system still falls back to raw shell for most work, but known helpers are no longer treated as pure free-form text.
 
 ## Next Recommended Step
 

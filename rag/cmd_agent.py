@@ -12,6 +12,8 @@ from typing import Any
 from agent import hybrid_retrieve, load_index, short_history
 from common import chat_completion, load_dotenv, require_env
 from solver_shared import (
+    available_actions_summary,
+    compile_action_command,
     FLAG_RE,
     MemoryStore,
     derive_phase_state,
@@ -32,6 +34,7 @@ from solver_shared import (
     task_prior_summary,
     update_hypotheses,
     validate_action,
+    validate_action_spec,
     validate_command,
 )
 from task_interpreter import run_task_interpreter, should_refresh_interpretation
@@ -187,6 +190,7 @@ def main() -> None:
         hints_text = hint_summary(memory, max_items=8)
         reflect_summary = reflection_summary(memory, max_items=8)
         hypo_summary = hypothesis_summary(memory, max_items=12)
+        actions_text = available_actions_summary()
         expected_phase, constraints = derive_phase_state(memory, history)
         constraint_text = "\n".join(f"- {item}" for item in constraints) if constraints else "- none"
 
@@ -213,9 +217,10 @@ def main() -> None:
             "{"
             "\"analysis\":\"1-2 short sentences\","
             "\"confidence\":0.0,"
-            "\"decision\":\"command|done\","
+            "\"decision\":\"command|action|done\","
             "\"phase\":\"recon|probe|exploit|extract|verify|done\","
             "\"command\":\"shell command string, may use $TARGET_URL\","
+            "\"action\":{\"name\":\"optional structured action name\",\"args\":{\"key\":\"value\"}},"
             "\"success_signal\":\"what confirms progress\","
             "\"next_if_fail\":\"fallback command idea\""
             "}"
@@ -233,6 +238,7 @@ def main() -> None:
             f"Comment hints:\n{hints_text}\n\n"
             f"Persistent memory facts:\n{memory_summary}\n\n"
             f"Hypotheses:\n{hypo_summary}\n\n"
+            f"Structured actions:\n{actions_text}\n\n"
             f"Reflection constraints:\n{reflect_summary}\n\n"
             f"Recent history:\n{short_history(history)}\n\n"
             f"Recent observations:\n{recent_observations(history)}\n\n"
@@ -263,6 +269,10 @@ def main() -> None:
             break
 
         raw_cmd = str(plan.get("command", "")).replace("{target}", target).strip()
+        action_obj = plan.get("action", {})
+        if decision == "action":
+            action_spec = validate_action_spec(action_obj if isinstance(action_obj, dict) else {}, memory)
+            raw_cmd = compile_action_command(action_spec, memory)
         cmd = validate_command(repair_helper_command(raw_cmd, memory))
         ok, reason = validate_action(phase=phase, expected_phase=expected_phase, command=cmd, memory=memory, history=history)
         if not ok:
@@ -347,6 +357,7 @@ def main() -> None:
             "analysis": analysis,
             "confidence": confidence,
             "command": cmd,
+            "action": action_obj if isinstance(action_obj, dict) else {},
             "success_signal": success_signal,
             "next_if_fail": next_if_fail,
             "returncode": result["returncode"],
