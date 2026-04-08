@@ -58,6 +58,69 @@ NOISE_PATTERNS = [
     re.compile(r"typing_extensions", re.IGNORECASE),
 ]
 ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
+    "http_probe_with_baseline": {
+        "script": "$PROJECT_ROOT/scripts/http_probe_with_baseline.py",
+        "required": ["url"],
+        "arg_map": {
+            "url": "--url",
+            "method": "--method",
+            "baseline_url": "--baseline-url",
+            "timeout": "--timeout",
+            "body": "--body",
+            "content_type": "--content-type",
+        },
+    },
+    "extract_html_attack_surface": {
+        "script": "$PROJECT_ROOT/scripts/extract_html_attack_surface.py",
+        "required": ["html_file", "base_url"],
+        "arg_map": {
+            "html_file": "--html-file",
+            "base_url": "--base-url",
+            "out": "--out",
+        },
+    },
+    "cookiejar_flow_fetch": {
+        "script": "$PROJECT_ROOT/scripts/cookiejar_flow_fetch.py",
+        "required": ["base_url", "cookiejar", "fetch_url"],
+        "arg_map": {
+            "base_url": "--base-url",
+            "cookiejar": "--cookiejar",
+            "login_url": "--login-url",
+            "login_method": "--login-method",
+            "login_body": "--login-body",
+            "login_content_type": "--login-content-type",
+            "fetch_url": "--fetch-url",
+            "fetch_method": "--fetch-method",
+            "fetch_body": "--fetch-body",
+            "timeout": "--timeout",
+        },
+    },
+    "service_recovery_probe": {
+        "script": "$PROJECT_ROOT/scripts/service_recovery_probe.py",
+        "required": ["url"],
+        "arg_map": {
+            "url": "--url",
+            "artifact_dir": "--artifact-dir",
+            "attempts": "--attempts",
+            "wait_seconds": "--wait-seconds",
+            "timeout": "--timeout",
+            "container_id": "--container-id",
+            "out": "--out",
+        },
+    },
+    "multipart_upload_with_known_action": {
+        "script": "$PROJECT_ROOT/scripts/multipart_upload_with_known_action.py",
+        "required": ["action_url", "file"],
+        "arg_map": {
+            "action_url": "--action-url",
+            "file": "--file",
+            "field_name": "--field-name",
+            "cookiejar": "--cookiejar",
+            "username": "--username",
+            "password": "--password",
+            "timeout": "--timeout",
+        },
+    },
     "build_jsp_war": {
         "script": "$PROJECT_ROOT/scripts/build_jsp_war.py",
         "required": ["out", "target_file"],
@@ -509,6 +572,64 @@ def available_actions_summary() -> str:
 
 
 def action_defaults(name: str, memory: MemoryStore) -> dict[str, str]:
+    if name == "http_probe_with_baseline":
+        target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
+        return {
+            "url": target,
+            "method": "GET",
+            "baseline_url": target,
+            "timeout": "15",
+        }
+    if name == "extract_html_attack_surface":
+        target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
+        artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
+        html_file = memory.get_fact("artifact.html_file") or str(Path(artifact_dir) / "root.body")
+        return {
+            "html_file": html_file,
+            "base_url": target,
+            "out": str(Path(artifact_dir) / "html_attack_surface.json"),
+        }
+    if name == "cookiejar_flow_fetch":
+        target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
+        artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
+        return {
+            "base_url": target,
+            "cookiejar": str(Path(artifact_dir) / "workflow_cookie.jar"),
+            "fetch_url": target,
+            "fetch_method": "GET",
+            "timeout": "20",
+        }
+    if name == "service_recovery_probe":
+        target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
+        artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
+        return {
+            "url": target,
+            "artifact_dir": artifact_dir,
+            "attempts": "3",
+            "wait_seconds": "12",
+            "timeout": "6",
+            "out": str(Path(artifact_dir) / "service_recovery_probe.json"),
+        }
+    if name == "multipart_upload_with_known_action":
+        target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
+        artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
+        action_url = (memory.get_fact("tomcat.upload_action") or "").strip()
+        if action_url.startswith("/") and target:
+            action_url = target + action_url
+        creds = memory.get_fact("tomcat.creds") or ""
+        username = ""
+        password = ""
+        if ":" in creds:
+            username, password = creds.split(":", 1)
+        return {
+            "action_url": action_url,
+            "file": memory.get_fact("artifact.war_path") or str(Path(artifact_dir) / "readfile.war"),
+            "field_name": "deployWar",
+            "cookiejar": str(Path(artifact_dir) / "tomcat_cookie.jar"),
+            "username": username,
+            "password": password,
+            "timeout": "30",
+        }
     if name == "build_jsp_war":
         artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
         target_file = memory.get_fact("target.file") or ""
@@ -565,10 +686,18 @@ def validate_action_spec(raw: dict[str, Any], memory: MemoryStore) -> dict[str, 
     return spec
 
 
+def resolve_action_script(script: str, memory: MemoryStore) -> str:
+    project_root = memory.get_fact("project.root")
+    if project_root:
+        return script.replace("$PROJECT_ROOT", project_root)
+    return script
+
+
 def compile_action_command(action: dict[str, Any], memory: MemoryStore) -> str:
     spec = validate_action_spec(action, memory)
     schema = ACTION_SCHEMAS[spec["name"]]
-    parts = ["python3", shlex.quote(schema["script"])]
+    script_path = resolve_action_script(schema["script"], memory)
+    parts = ["python3", shlex.quote(script_path)]
     for key, flag in schema["arg_map"].items():
         value = spec["args"].get(key, "").strip()
         if value:
@@ -774,10 +903,116 @@ def extract_relative_paths(text: str) -> list[str]:
     return out
 
 
+def _load_action_json(stdout: str) -> dict[str, Any] | None:
+    raw = stdout.strip()
+    if not raw or not raw.startswith("{"):
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def extract_structured_action_facts(command: str, stdout: str) -> list[tuple[str, str, float]]:
+    payload = _load_action_json(stdout)
+    if not payload:
+        return []
+
+    facts: list[tuple[str, str, float]] = []
+
+    if "extract_html_attack_surface.py" in command:
+        paths = payload.get("candidate_paths", [])
+        if isinstance(paths, list):
+            for raw in paths[:40]:
+                value = str(raw).strip()
+                if not value:
+                    continue
+                path_hash = hashlib.md5(value.encode("utf-8")).hexdigest()[:8]
+                facts.append((f"endpoint.candidate.{path_hash}", value[:180], 0.93))
+            if paths:
+                facts.append(("endpoint.focus", str(paths[0]).strip()[:180], 0.91))
+
+        forms = payload.get("forms", [])
+        if isinstance(forms, list):
+            for index, item in enumerate(forms[:10], start=1):
+                if not isinstance(item, dict):
+                    continue
+                action = str(item.get("action", "")).strip()
+                method = str(item.get("method", "")).strip().upper()
+                if action:
+                    facts.append((f"form.action.{index}", action[:180], 0.91))
+                    path_hash = hashlib.md5(action.encode("utf-8")).hexdigest()[:8]
+                    facts.append((f"endpoint.candidate.{path_hash}", action[:180], 0.92))
+                if method:
+                    facts.append((f"form.method.{index}", method[:20], 0.82))
+                inputs = item.get("inputs", [])
+                if isinstance(inputs, list):
+                    for raw_name in inputs[:12]:
+                        name = str(raw_name).strip()
+                        if name:
+                            facts.append((f"entrypoint.candidate.{name[:40]}", "form-input", 0.88))
+                hidden = item.get("hidden", {})
+                if isinstance(hidden, dict):
+                    for raw_name, raw_value in list(hidden.items())[:12]:
+                        name = str(raw_name).strip()
+                        value = str(raw_value).strip()
+                        if name:
+                            facts.append((f"form.hidden.{name[:60]}", value[:120], 0.90))
+
+        filenames = payload.get("filenames", [])
+        if isinstance(filenames, list):
+            for raw in filenames[:20]:
+                value = str(raw).strip()
+                if not value:
+                    continue
+                file_hash = hashlib.md5(value.encode("utf-8")).hexdigest()[:8]
+                facts.append((f"asset.filename.{file_hash}", value[:180], 0.87))
+
+        comments = payload.get("comments", [])
+        if isinstance(comments, list):
+            for raw in comments[:10]:
+                value = str(raw).strip()
+                if not value:
+                    continue
+                comment_hash = hashlib.md5(value.encode("utf-8")).hexdigest()[:8]
+                facts.append((f"hint.comment.{comment_hash}", value[:240], 0.86))
+
+    if "service_recovery_probe.py" in command:
+        classification = str(payload.get("classification", "")).strip()
+        if classification:
+            facts.append(("service.recovery.classification", classification[:80], 0.94))
+        if payload.get("tcp_connect") is True:
+            facts.append(("service.tcp.reachable", "true", 0.94))
+        if payload.get("ready_http") is True:
+            facts.append(("service.http.ready", "true", 0.96))
+        if payload.get("empty_http_reply") is True:
+            facts.append(("service.http.empty_reply", "true", 0.95))
+        http_status = str(payload.get("http_status", "")).strip()
+        if http_status.isdigit():
+            facts.append(("http.last_status", http_status, 0.92))
+        suggested = str(payload.get("suggested_url", "")).strip()
+        if suggested:
+            facts.append(("target.candidate.recovered", suggested[:220], 0.90))
+        http_error = str(payload.get("http_error_kind", "")).strip()
+        if http_error:
+            facts.append(("service.http.error_kind", http_error[:80], 0.90))
+        https_error = str(payload.get("https_error_kind", "")).strip()
+        if https_error:
+            facts.append(("service.https.error_kind", https_error[:80], 0.86))
+        logs_excerpt = str(payload.get("container_logs_excerpt", "")).strip()
+        if logs_excerpt:
+            facts.append(("benchmark.container_logs", logs_excerpt[:240], 0.78))
+
+    return facts
+
+
 def extract_facts(command: str, stdout: str, stderr: str) -> list[tuple[str, str, float]]:
     facts: list[tuple[str, str, float]] = []
     merged = f"{stdout}\n{stderr}"
     merged_lower = merged.lower()
+
+    facts.extend(extract_structured_action_facts(command, stdout))
 
     for name in extract_form_input_names(stdout):
         facts.append((f"entrypoint.candidate.{name}", "form-input", 0.80))
