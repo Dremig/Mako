@@ -48,6 +48,7 @@ This file is reserved for PentAGI-driven design input and integration notes.
 - Structured-action JSON outputs are now parsed back into runtime memory facts, so action results can drive follow-up planning instead of remaining opaque stdout.
 - Added a capability-resolution layer (`web_agent/capability.py`) before execution. It scores `reuse_existing_action`, `write_helper_script`, `install_dependency`, and `replan`.
 - Added a separate logistics layer (`web_agent/logistics.py`) that receives support tasks from capability resolution and performs environment setup/tool supplementation without consuming challenge steps.
+- Logistics install strategy is model-driven with hard fallback (`pip`, `system_package_manager`, or `skip_install`) and dynamic install targets.
 
 ## NYU Bench findings
 

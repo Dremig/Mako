@@ -266,9 +266,10 @@ Capability and logistics behavior:
    - generated helper script
    - controlled install
    - replan
-3. logistics executes support work for the chosen option
-4. logistics work is tracked as `capability_steps` and does not consume `challenge_steps`
-5. GUI-heavy tools such as `stegsolve` are treated as a separate tool family instead of being mis-modeled as a pip dependency
+3. logistics strategy selection is model-driven (`pip` vs `system_package_manager` vs `skip_install`) with deterministic safety fallback
+4. logistics executes support work for the chosen option
+5. logistics work is tracked as `capability_steps` and does not consume `challenge_steps`
+6. install targets are dynamic (not a fixed allowlist), but install timing is constrained by capability-policy and step accounting
 
 ## Quick Fuzz (No LLM)
 

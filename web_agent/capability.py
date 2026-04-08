@@ -207,6 +207,14 @@ def score_capability_options(
                 "reason": "installing the missing Python package may unblock the proposal but changes the environment",
             }
         )
+    if gap.get("kind") == "missing_tool":
+        options.append(
+            {
+                "name": "install_dependency",
+                "score": 0.52,
+                "reason": "missing command-line tool can be installed by logistics when no stable action/helper path exists",
+            }
+        )
     options.append(
         {
             "name": "replan",
@@ -236,7 +244,6 @@ def resolve_capability_gap(
         "reason": str(selected.get("reason", "")),
         "proposal": proposal,
         "performed": False,
-        "acquisition_command": "",
     }
     if selected["name"] == "reuse_existing_action":
         revised = dict(proposal)
@@ -272,7 +279,8 @@ def resolve_capability_gap(
         out["artifact"] = str(helper_path)
         return out
     if selected["name"] == "install_dependency":
-        out["acquisition_command"] = "python3 -m pip install beautifulsoup4"
+        install_target = str(gap.get("dependency") or gap.get("tool") or "").strip()
+        if install_target:
+            out["install_target"] = install_target
         return out
     return out
-

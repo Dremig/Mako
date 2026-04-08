@@ -33,6 +33,7 @@ It records the key ideas that matter for the current agent iteration.
 - Structured actions and validator/executor layers are needed for critical chains.
 - Capability acquisition should be tracked separately from challenge progress.
 - Installing dependencies is the highest-impact option and should lose to reuse/helper generation unless it clearly wins.
+- Install targets should stay dynamic. We constrain install timing and accounting, not a hardcoded package list.
 
 6. Information gain should gate actions.
 - Avoid repeating commands with low new evidence.

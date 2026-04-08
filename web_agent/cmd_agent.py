@@ -15,7 +15,7 @@ from rag.agent import hybrid_retrieve, load_index, short_history
 from rag.common import chat_completion, load_dotenv, require_env
 from web_agent.capability import resolve_capability_gap
 from web_agent.deliberation import choose_final_proposal, run_corrector, run_recommender
-from web_agent.logistics import build_logistics_request, perform_logistics_request
+from web_agent.logistics import build_logistics_request, perform_logistics_request, run_logistics_decider
 from web_agent.planner import (
     apply_plan_patch,
     build_plan_patch,
@@ -583,7 +583,16 @@ def main() -> None:
                 memory=memory,
                 artifact_dir=artifact_dir,
             )
-            logistics = build_logistics_request(capability)
+            logistics_decision = run_logistics_decider(
+                base_url=base_url,
+                api_key=api_key,
+                model=chat_model,
+                capability=capability,
+                available_tools=tools,
+                memory_summary=memory_summary,
+                recent_history=short_history(history),
+            )
+            logistics = build_logistics_request(capability, tools, logistics_decision)
             if capability.get("selected") != "keep_current":
                 capability_steps += 1
                 capability_entry = {
@@ -594,6 +603,7 @@ def main() -> None:
                     "gap": capability.get("gap", {}),
                     "scores": capability.get("scores", []),
                     "performed": bool(capability.get("performed", False)),
+                    "logistics_decision": logistics_decision,
                     "logistics_request": logistics,
                 }
                 if capability.get("artifact"):
