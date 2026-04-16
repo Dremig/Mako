@@ -17,6 +17,8 @@ This repo is a local-first blackbox CTF workspace with two core layers:
 
 - `docs/init.md`: current baseline thinking after removing legacy `sync/`
 - `docs/pentagi.md`: PentAGI-driven integration notes and follow-up decisions
+  - includes NYU Web smoke rerun notes (`2026-04-11`) with intended-exploit verification and reliability-evaluation boundaries
+- `docs/codex.md`: research notes on moving this repo to a Codex-backed foundation via Responses API and function tools
 
 ## Current Sources
 
@@ -108,14 +110,17 @@ Architecture:
    - reflection constraints
 5. controller reflection runs in parallel and emits policy constraints
 6. validator layer blocks phase drift, low-gain repeats, and semantic-recovery violations
-7. recommender proposes one concrete action/command, corrector attacks it, and judge selects the final executable step
-8. capability manager evaluates execution gaps (`reuse existing action` vs `write helper` vs `install dependency` vs `replan`)
-9. logistics layer executes environment/setup work requested by capability resolution and records it outside challenge-step counting
-10. command output updates:
+7. in `codex` / `codex_collab` mode, a single Codex tactical solver proposes the next executable step
+8. in `codex_collab` mode, a counter-solver / falsifier attacks the current route and proposes a cheap discriminator experiment before the tactical step
+9. capability manager evaluates execution gaps (`reuse existing action` vs `write helper` vs `install dependency` vs `replan`)
+10. logistics layer executes environment/setup work requested by capability resolution and records it outside challenge-step counting
+11. command output updates:
    - facts
    - reflection state
    - hypothesis lifecycle
    - plan patches for follow-up subtasks
+
+`codex_collab` runs also write `artifacts/.../<run_id>/codex_dialogue.jsonl`, which records the counter-solver and tactical solver prompts/replies for post-run inspection.
 11. interpreter/planner are refreshed periodically or after drift / repeated low-gain failure
 
 Architecture diagram:

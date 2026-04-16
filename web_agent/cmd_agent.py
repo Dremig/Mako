@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import json
 import os
 from queue import Empty, Queue
+import signal
 import sys
 import threading
 import time
@@ -14,7 +16,7 @@ from typing import Any
 from rag.agent import hybrid_retrieve, load_index, short_history
 from rag.common import chat_completion, load_dotenv, require_env
 from web_agent.capability import resolve_capability_gap
-from web_agent.deliberation import choose_final_proposal, run_corrector, run_recommender
+from web_agent.deliberation import choose_final_proposal, run_corrector, run_counter_solver, run_recommender, run_tactical_solver
 from web_agent.logistics import build_logistics_request, perform_logistics_request, run_logistics_decider
 from web_agent.planner import (
     apply_plan_patch,
@@ -28,7 +30,9 @@ from web_agent.planner import (
 from web_agent.reflector import run_reflector_worker
 from web_agent.solver_shared import (
     available_actions_summary,
+    canonical_action_name,
     compile_action_command,
+    derive_gain_budget_policy,
     FLAG_RE,
     MemoryStore,
     derive_phase_state,
@@ -39,12 +43,16 @@ from web_agent.solver_shared import (
     hint_summary,
     info_gain_score,
     normalize_command,
+    preflight_command_quality,
     repair_helper_command,
     recent_observations,
     reflection_summary,
     reflect_step,
+    merge_controller_with_gain_policy,
     run_shell_command,
+    soften_controller_for_codex,
     strip_noise,
+    suggested_phase_for_action,
     task_prior_summary,
     update_hypotheses,
     validate_action,
@@ -56,6 +64,19 @@ from web_agent.task_interpreter import run_task_interpreter, should_refresh_inte
 
 def utc_now_z() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_path.replace(path)
+
+
+def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
 def summarize_run(
@@ -209,13 +230,19 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path("logs/cmd_agent_last_run.json"))
     parser.add_argument("--artifact-dir", type=Path, default=Path("artifacts/cmd_agent"))
     parser.add_argument("--worker-mode", type=str, default="threaded", choices=["threaded", "sync"])
+    parser.add_argument(
+        "--solver-mode",
+        type=str,
+        default=os.getenv("OPENAI_SOLVER_MODE", "codex").strip().lower() or "codex",
+        choices=["codex", "codex_pure", "codex_collab", "legacy"],
+    )
     args = parser.parse_args()
 
     root = args.root.resolve()
     load_dotenv((root / args.env).resolve())
 
     api_key = require_env("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+    base_url = os.getenv("OPENAI_BASE_URL", "https://yunwu.ai/v1").strip()
     chat_model = os.getenv("OPENAI_AGENT_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-5.2")).strip()
     embed_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
 
@@ -226,6 +253,7 @@ def main() -> None:
     run_id = args.run_id.strip() or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     artifact_dir = (root / args.artifact_dir / run_id).resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    dialogue_log_path = (artifact_dir / "codex_dialogue.jsonl").resolve()
 
     memory_db_path = (root / args.memory_db).resolve()
     if not args.memory_db.is_absolute() and str(args.memory_db).startswith("logs/"):
@@ -233,6 +261,7 @@ def main() -> None:
     out_path = (root / args.out).resolve()
     if not args.out.is_absolute() and str(args.out).startswith("logs/"):
         out_path = (artifact_dir / args.out.name).resolve()
+    heartbeat_path = (artifact_dir / "cmd_agent_heartbeat.json").resolve()
 
     memory = MemoryStore(memory_db_path, run_id=run_id)
     memory.upsert_fact("target", target, 1.0, 0)
@@ -258,6 +287,8 @@ def main() -> None:
     found_flag = ""
     done = False
     final_report = ""
+    current_step = 0
+    current_stage = "init"
     current_plan = fallback_plan(memory)
     persist_plan(memory, current_plan, step=0)
     orchestrator = QueueWorkerOrchestrator(max_workers=2) if args.worker_mode == "threaded" else None
@@ -271,10 +302,88 @@ def main() -> None:
     env.pop("HTTP_PROXY", None)
     env.pop("HTTPS_PROXY", None)
 
+    def log_dialogue(step: int, kind: str, payload: dict[str, Any]) -> None:
+        body = {
+            "ts": utc_now_z(),
+            "step": step,
+            "kind": kind,
+            "solver_mode": args.solver_mode,
+            "payload": payload,
+        }
+        append_jsonl(dialogue_log_path, body)
+        memory.add_event(step, f"dialogue.{kind}", json.dumps(payload, ensure_ascii=False)[:3000])
+
+    def build_run_obj(*, include_memory: bool = True, partial: bool = True) -> dict[str, Any]:
+        return {
+            "timestamp": utc_now_z(),
+            "run_id": run_id,
+            "target": target,
+            "objective": args.objective,
+            "hint": args.hint,
+            "model": chat_model,
+            "memory_db": str(memory_db_path),
+            "artifact_dir": str(artifact_dir),
+            "heartbeat_path": str(heartbeat_path),
+            "tools": tools,
+            "memory_facts": memory.export_facts() if include_memory else {},
+            "execution_state": memory.export_execution_state() if include_memory else {},
+            "steps": history,
+            "challenge_steps": len(history),
+            "capability_steps": capability_steps,
+            "capability_history": capability_history,
+            "done": done,
+            "flag": found_flag,
+            "final_report": final_report,
+            "partial": partial,
+            "current_step": current_step,
+            "current_stage": current_stage,
+            "current_plan": current_plan,
+        }
+
+    def flush_run_state(stage: str, *, final: bool = False) -> None:
+        nonlocal current_stage
+        current_stage = stage
+        payload = build_run_obj(include_memory=True, partial=not final)
+        atomic_write_json(heartbeat_path, payload)
+        atomic_write_json(out_path, payload)
+
+    def handle_termination(signum: int, _frame: Any) -> None:
+        nonlocal final_report
+        memory.add_event(current_step, "termination_signal", f"signal={signum}")
+        if not final_report:
+            final_report = f"Run interrupted by signal {signum} during {current_stage}."
+        try:
+            flush_run_state(f"signal_{signum}", final=True)
+        finally:
+            raise SystemExit(128 + int(signum))
+
+    signal.signal(signal.SIGTERM, handle_termination)
+    signal.signal(signal.SIGINT, handle_termination)
+    atexit.register(lambda: flush_run_state(current_stage or "exit", final=bool(done or found_flag or final_report)))
+    flush_run_state("initialized")
+
     try:
         for step in range(1, max(1, args.max_steps) + 1):
-            refresh_interpreter = should_refresh_interpretation(step, memory, history)
-            if args.worker_mode == "threaded":
+            current_step = step
+            flush_run_state("step_start")
+            is_collab_mode = args.solver_mode == "codex_collab"
+            refresh_interpreter = should_refresh_interpretation(step, memory, history) if args.solver_mode not in {"codex_pure", "codex_collab"} else False
+            if args.solver_mode in {"codex_pure", "codex_collab"}:
+                prior = {}
+                controller_reflection = {
+                    "phase_override": "",
+                    "failure_cluster": "none",
+                    "must_do": [],
+                    "must_avoid": [],
+                    "rationale": f"{args.solver_mode} mode: interpreter/reflector advisory layers bypassed",
+                    "requirements": {
+                        "change_command_family": False,
+                        "require_explicit_success_signal": False,
+                        "force_plan_refresh": False,
+                        "force_branch_shift": False,
+                    },
+                }
+            elif args.worker_mode == "threaded":
                 assert orchestrator is not None
                 expected_phase_local, _ = derive_phase_state(memory, history)
                 task_priors_text = task_prior_summary(memory, max_items=20)
@@ -322,6 +431,7 @@ def main() -> None:
                 )
                 job_ids.append(reflector_job_id)
                 try:
+                    current_stage = "worker_collect"
                     worker_outputs = orchestrator.collect(job_ids, timeout_sec=180.0)
                     prior = worker_outputs.get(prior_job_id, {}) if refresh_interpreter else {}
                     controller_reflection = worker_outputs[reflector_job_id]
@@ -362,6 +472,7 @@ def main() -> None:
                         history=history,
                     )
             else:
+                current_stage = "interpreter_sync"
                 prior = run_interpreter_worker(
                     enabled=refresh_interpreter,
                     step=step,
@@ -380,6 +491,7 @@ def main() -> None:
                     history=history,
                     memory=memory,
                 )
+                current_stage = "reflector_sync"
                 controller_reflection = run_reflector_worker(
                     step=step,
                     base_url=base_url,
@@ -395,6 +507,12 @@ def main() -> None:
                     memory=memory,
                     history=history,
                 )
+            gain_policy = derive_gain_budget_policy(
+                history=history,
+                expected_phase=derive_phase_state(memory, history)[0],
+            )
+            controller_reflection = merge_controller_with_gain_policy(controller_reflection, gain_policy)
+            flush_run_state("post_reflection")
             if refresh_interpreter:
                 print(f"[step {step}] interpreter primary={','.join(prior.get('primary_hypotheses', [])[:3]) or 'none'} family={prior.get('challenge_family', 'unknown')}")
 
@@ -404,6 +522,7 @@ def main() -> None:
                 f"history:\n{short_history(history)}"
             )
             try:
+                current_stage = "retrieval"
                 hits = hybrid_retrieve(
                     query=retrieval_query,
                     docs=docs,
@@ -456,8 +575,17 @@ def main() -> None:
                 step,
             )
             memory.add_event(step, "controller_reflection", json.dumps(controller_reflection, ensure_ascii=False))
+            if gain_policy.get("breach"):
+                memory.add_event(step, "gain_budget", json.dumps(gain_policy, ensure_ascii=False)[:3000])
+                memory.upsert_fact("gain_budget.last_severity", str(gain_policy.get("severity", "none"))[:40], 0.95, step)
+                memory.upsert_fact("gain_budget.low_gain_streak", str(gain_policy.get("summary", {}).get("low_gain_streak", 0)), 0.95, step)
+                memory.upsert_fact("gain_budget.recent_total_gain", str(gain_policy.get("summary", {}).get("recent_total_gain", 0.0)), 0.95, step)
             constraint_text = "\n".join(f"- {item}" for item in constraints) if constraints else "- none"
-            if refresh_interpreter or not current_subtask(current_plan):
+            if gain_policy.get("requirements", {}).get("force_plan_refresh", False):
+                current_plan = {"rationale": "forced_replan_by_gain_budget", "subtasks": []}
+                persist_plan(memory, current_plan, step)
+            if (refresh_interpreter or not current_subtask(current_plan)) and not is_collab_mode:
+                current_stage = "planning"
                 current_plan = run_plan_worker(
                     base_url=base_url,
                     api_key=api_key,
@@ -478,6 +606,7 @@ def main() -> None:
                 )
                 persist_plan(memory, current_plan, step)
                 memory.add_event(step, "plan_refresh", json.dumps(current_plan, ensure_ascii=False)[:3000])
+                flush_run_state("post_plan")
             active_subtask = current_subtask(current_plan)
             if active_subtask:
                 expected_phase = str(active_subtask.get("phase", expected_phase)).strip().lower() or expected_phase
@@ -485,97 +614,176 @@ def main() -> None:
             active_goal = str(active_subtask.get("goal", "")).strip() or "none"
             active_signal = str(active_subtask.get("success_signal", "")).strip() or "none"
             active_action = str(active_subtask.get("suggested_action", "")).strip() or ""
+            active_discussion = str(active_subtask.get("discussion", "")).strip()
+            active_open_questions = [
+                str(item).strip()
+                for item in active_subtask.get("open_questions", [])
+                if str(item).strip()
+            ] if isinstance(active_subtask.get("open_questions", []), list) else []
 
-            planner_prompt = (
-                "You are a Codex-style CTF command agent.\n"
-                "A planner has already selected the current subtask. Execute that subtask rather than improvising a brand-new route.\n"
-                "A separate interpreter has already produced task priors. Treat those priors as strong guidance unless runtime evidence is overwhelming.\n"
-                "Output one concrete shell command per step, then iterate from observed output.\n"
-                "Use persistent memory facts, hypotheses, and reflection constraints as hard constraints.\n"
-                "Treat the current subtask as the primary objective for this step.\n"
-                "Minimize recon once actionable entrypoints exist. Prefer commands with the highest expected information gain.\n"
-                "Only treat actual request inputs as attack surfaces: query parameters, form input names, headers, cookies, request bodies, or confirmed API fields.\n"
-                "Do not treat HTML meta tags, author tags, renderer hints, or other static markup labels as controllable parameters unless they are proven to be sent in a request.\n"
-                "For frontend/source-inspection challenges, treat HTML comments, href/src links, and hinted backup filenames as candidate endpoints to fetch directly.\n"
-                "When a new endpoint candidate is known, fetch that endpoint before retrying the current page or switching to speculative exploit classes.\n"
-                "When a page exposes a POST form with known input names, submit a benign value first to observe the next stage before speculative exploit payloads.\n"
-                "When a POST form exposes hidden default inputs, submit those defaults as-is before inventing alternative parameters or attack classes.\n"
-                "When a form field's sample value is JSON text, consider a minimal malformed JSON probe to test for parser-error information leakage.\n"
-                "If a Werkzeug or traceback debug page appears, inspect it directly for leaked source comments, secrets, and flags.\n"
-                "If Tomcat Manager Basic Auth is detected, try a small Tomcat default-credential set first (for example tomcat:tomcat, tomcat:s3cret, admin:admin, manager:manager).\n"
-                "If Tomcat Manager GUI access succeeds, use one cookie jar, fetch /manager/html, parse the exact HTML upload action (including jsessionid and CSRF nonce), build a minimal WAR with a JSP reader, upload it through that exact HTML manager action, then fetch the deployed JSP to read the target file.\n"
-                "When generating helper artifacts such as WAR files or cookie jars, write them under $AGENT_ARTIFACT_DIR or the current working directory with stable names, then reuse those paths instead of mktemp-only paths.\n"
-                "For Tomcat WAR generation, prefer the local helper script $PROJECT_ROOT/scripts/build_jsp_war.py over fragile shell heredocs.\n"
-                "For the full Tomcat Manager HTML upload chain, prefer the helper $PROJECT_ROOT/scripts/tomcat_manager_read_file.py when the goal is to read a server file through a deployed JSP.\n"
-                "If the current subtask is about extracting routes/forms from downloaded HTML, prefer the structured action `extract_html_attack_surface` instead of ad-hoc parsing scripts or optional dependencies like bs4.\n"
-                "If the current subtask is about abnormal empty replies / readiness / protocol mismatch, prefer the structured action `service_recovery_probe`.\n"
-                "If the planner suggested a structured action, use it unless there is a clear stronger reason not to.\n"
-                "Return ONLY JSON schema:\n"
-                "{"
-                "\"analysis\":\"1-2 short sentences\","
-                "\"confidence\":0.0,"
-                "\"decision\":\"command|action|done\","
-                "\"phase\":\"recon|probe|exploit|extract|verify|done\","
-                "\"command\":\"shell command string, may use $TARGET_URL\","
-                "\"action\":{\"name\":\"optional structured action name\",\"args\":{\"key\":\"value\"}},"
-                "\"success_signal\":\"what confirms progress\","
-                "\"next_if_fail\":\"fallback command idea\""
-                "}"
-            )
-            user_prompt = (
-                f"Target: {target}\n"
-                f"Objective: {args.objective}\n"
-                f"Hint: {args.hint}\n"
-                f"Step: {step}/{args.max_steps}\n"
-                f"Expected phase: {expected_phase}\n"
-                f"Current subtask title: {active_title}\n"
-                f"Current subtask goal: {active_goal}\n"
-                f"Current subtask success signal: {active_signal}\n"
-                f"Current subtask suggested action: {active_action or 'none'}\n"
-                f"Current plan:\n{plan_summary(current_plan)}\n\n"
-                f"Available tools: {json.dumps(available_tools, ensure_ascii=False)}\n"
-                f"Active constraints:\n{constraint_text}\n\n"
-                f"Task priors:\n{prior_summary}\n\n"
-                f"Endpoint candidates:\n{endpoints_text}\n\n"
-                f"Comment hints:\n{hints_text}\n\n"
-                f"Persistent memory facts:\n{memory_summary}\n\n"
-                f"Hypotheses:\n{hypo_summary}\n\n"
-                f"Structured actions:\n{actions_text}\n\n"
-                f"Reflection constraints:\n{reflect_summary}\n\n"
-                f"Controller reflection:\n{json.dumps(controller_reflection, ensure_ascii=False)}\n\n"
-                f"Recent history:\n{short_history(history)}\n\n"
-                f"Recent observations:\n{recent_observations(history)}\n\n"
-                f"Retrieved context:\n{context}\n"
-            )
-
-            recommender_plan = run_recommender(
-                base_url=base_url,
-                api_key=api_key,
-                model=chat_model,
-                system_prompt=planner_prompt,
-                user_prompt=user_prompt,
-            )
-            corrector_review = run_corrector(
-                base_url=base_url,
-                api_key=api_key,
-                model=chat_model,
-                target=target,
-                step=step,
-                active_title=active_title,
-                active_goal=active_goal,
-                active_signal=active_signal,
-                active_action=active_action,
-                controller_reflection=controller_reflection,
-                recommender=recommender_plan,
-                available_actions_text=actions_text,
-                memory_summary=memory_summary,
-                recent_history=short_history(history),
-            )
-            plan, judge = choose_final_proposal(
-                recommender=recommender_plan,
-                corrector=corrector_review,
-                active_action=active_action,
-            )
+            current_stage = "deliberation"
+            recommender_plan: dict[str, Any] = {}
+            corrector_review: dict[str, Any] = {}
+            counter_solver_notes: dict[str, Any] = {}
+            if args.solver_mode in {"codex", "codex_pure", "codex_collab"}:
+                planner_context_text = (
+                    f"Plan rationale: {str(current_plan.get('rationale', '')).strip()}\n"
+                    f"Current plan summary:\n{plan_summary(current_plan)}\n\n"
+                    f"Endpoint candidates:\n{endpoints_text}\n\n"
+                    f"Comment hints:\n{hints_text}\n"
+                )
+                interpreter_notes_text = (
+                    f"Task priors:\n{prior_summary}\n\n"
+                    f"Hypotheses:\n{hypo_summary}\n"
+                )
+                reflector_notes_text = (
+                    f"Controller rationale: {str(controller_reflection.get('rationale', '')).strip() or 'none'}\n"
+                    f"Recent reflection summary:\n{reflect_summary}\n\n"
+                    f"Soft notes from reflector:\n"
+                    + ("\n".join(f"- {item}" for item in (controller_do + controller_avoid)[:6]) if (controller_do or controller_avoid) else "- none")
+                )
+                if args.solver_mode in {"codex_pure", "codex_collab"}:
+                    planner_context_text = f"{args.solver_mode} mode: planner/interpreter/reflector are advisory only. Prioritize runtime evidence."
+                    interpreter_notes_text = f"{args.solver_mode} mode: interpreter priors disabled for this run."
+                    reflector_notes_text = f"{args.solver_mode} mode: reflector policy disabled for this run."
+                if is_collab_mode:
+                    counter_solver_notes = run_counter_solver(
+                        base_url=base_url,
+                        api_key=api_key,
+                        model=chat_model,
+                        target=target,
+                        objective=args.objective,
+                        step=step,
+                        expected_phase=expected_phase,
+                        current_plan_text=plan_summary(current_plan),
+                        memory_summary=memory_summary,
+                        hypotheses_text=hypo_summary,
+                        recent_history=short_history(history),
+                        recent_obs=recent_observations(history),
+                        retrieved_context=context,
+                        trace_hook=(lambda payload: log_dialogue(step, str(payload.get("kind", "counter")), payload)),
+                    )
+                plan, judge = run_tactical_solver(
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=chat_model,
+                    target=target,
+                    objective=args.objective,
+                    step=step,
+                    max_steps=args.max_steps,
+                    expected_phase=expected_phase,
+                    active_title=active_title,
+                    active_goal=active_goal,
+                    active_signal=active_signal,
+                    active_action=active_action,
+                    current_plan_text=plan_summary(current_plan),
+                    planner_discussion=active_discussion,
+                    planner_open_questions=active_open_questions,
+                    available_tools_text=json.dumps(available_tools, ensure_ascii=False),
+                    interpreter_notes_text=interpreter_notes_text,
+                    planner_context_text=planner_context_text,
+                    reflector_notes_text=reflector_notes_text,
+                    memory_summary=memory_summary,
+                    hypotheses_text=hypo_summary,
+                    actions_text=actions_text,
+                    recent_history=short_history(history),
+                    recent_obs=recent_observations(history),
+                    retrieved_context=context,
+                    counter_solver_notes=counter_solver_notes,
+                    collab_mode=is_collab_mode,
+                    trace_hook=(lambda payload: log_dialogue(step, str(payload.get("kind", "tactical")), payload)),
+                )
+            else:
+                planner_prompt = (
+                    "You are a Codex-style CTF command agent.\n"
+                    "A planner has already selected the current subtask. Execute that subtask rather than improvising a brand-new route.\n"
+                    "A separate interpreter has already produced task priors. Treat those priors as strong guidance unless runtime evidence is overwhelming.\n"
+                    "Output one concrete shell command per step, then iterate from observed output.\n"
+                    "Use persistent memory facts, hypotheses, and reflection constraints as hard constraints.\n"
+                    "Treat the current subtask as the primary objective for this step.\n"
+                    "Minimize recon once actionable entrypoints exist. Prefer commands with the highest expected information gain.\n"
+                    "Only treat actual request inputs as attack surfaces: query parameters, form input names, headers, cookies, request bodies, or confirmed API fields.\n"
+                    "Do not treat HTML meta tags, author tags, renderer hints, or other static markup labels as controllable parameters unless they are proven to be sent in a request.\n"
+                    "For frontend/source-inspection challenges, treat HTML comments, href/src links, and hinted backup filenames as candidate endpoints to fetch directly.\n"
+                    "When a new endpoint candidate is known, fetch that endpoint before retrying the current page or switching to speculative exploit classes.\n"
+                    "When a page exposes a POST form with known input names, submit a benign value first to observe the next stage before speculative exploit payloads.\n"
+                    "When a POST form exposes hidden default inputs, submit those defaults as-is before inventing alternative parameters or attack classes.\n"
+                    "When a form field's sample value is JSON text, consider a minimal malformed JSON probe to test for parser-error information leakage.\n"
+                    "If a Werkzeug or traceback debug page appears, inspect it directly for leaked source comments, secrets, and flags.\n"
+                    "If Tomcat Manager Basic Auth is detected, try a small Tomcat default-credential set first (for example tomcat:tomcat, tomcat:s3cret, admin:admin, manager:manager).\n"
+                    "If Tomcat Manager GUI access succeeds, use one cookie jar, fetch /manager/html, parse the exact HTML upload action (including jsessionid and CSRF nonce), build a minimal WAR with a JSP reader, upload it through that exact HTML manager action, then fetch the deployed JSP to read the target file.\n"
+                    "When generating helper artifacts such as WAR files or cookie jars, write them under $AGENT_ARTIFACT_DIR or the current working directory with stable names, then reuse those paths instead of mktemp-only paths.\n"
+                    "For Tomcat WAR generation, prefer the local helper script $PROJECT_ROOT/scripts/build_jsp_war.py over fragile shell heredocs.\n"
+                    "For the full Tomcat Manager HTML upload chain, prefer the helper $PROJECT_ROOT/scripts/tomcat_manager_read_file.py when the goal is to read a server file through a deployed JSP.\n"
+                    "If the current subtask is about extracting routes/forms from downloaded HTML, prefer the structured action `extract_html_attack_surface` instead of ad-hoc parsing scripts or optional dependencies like bs4.\n"
+                    "If the current subtask is about abnormal empty replies / readiness / protocol mismatch, prefer the structured action `service_recovery_probe`.\n"
+                    "If the planner suggested a structured action, use it unless there is a clear stronger reason not to.\n"
+                    "Return ONLY JSON schema:\n"
+                    "{"
+                    "\"analysis\":\"1-2 short sentences\","
+                    "\"confidence\":0.0,"
+                    "\"decision\":\"command|action|done\","
+                    "\"phase\":\"recon|probe|exploit|extract|verify|done\","
+                    "\"command\":\"shell command string, may use $TARGET_URL\","
+                    "\"action\":{\"name\":\"optional structured action name\",\"args\":{\"key\":\"value\"}},"
+                    "\"success_signal\":\"what confirms progress\","
+                    "\"next_if_fail\":\"fallback command idea\""
+                    "}"
+                )
+                user_prompt = (
+                    f"Target: {target}\n"
+                    f"Objective: {args.objective}\n"
+                    f"Hint: {args.hint}\n"
+                    f"Step: {step}/{args.max_steps}\n"
+                    f"Expected phase: {expected_phase}\n"
+                    f"Current subtask title: {active_title}\n"
+                    f"Current subtask goal: {active_goal}\n"
+                    f"Current subtask success signal: {active_signal}\n"
+                    f"Current subtask suggested action: {active_action or 'none'}\n"
+                    f"Current plan:\n{plan_summary(current_plan)}\n\n"
+                    f"Available tools: {json.dumps(available_tools, ensure_ascii=False)}\n"
+                    f"Active constraints:\n{constraint_text}\n\n"
+                    f"Task priors:\n{prior_summary}\n\n"
+                    f"Endpoint candidates:\n{endpoints_text}\n\n"
+                    f"Comment hints:\n{hints_text}\n\n"
+                    f"Persistent memory facts:\n{memory_summary}\n\n"
+                    f"Hypotheses:\n{hypo_summary}\n\n"
+                    f"Structured actions:\n{actions_text}\n\n"
+                    f"Reflection constraints:\n{reflect_summary}\n\n"
+                    f"Controller reflection:\n{json.dumps(controller_reflection, ensure_ascii=False)}\n\n"
+                    f"Recent history:\n{short_history(history)}\n\n"
+                    f"Recent observations:\n{recent_observations(history)}\n\n"
+                    f"Retrieved context:\n{context}\n"
+                )
+                recommender_plan = run_recommender(
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=chat_model,
+                    system_prompt=planner_prompt,
+                    user_prompt=user_prompt,
+                )
+                corrector_review = run_corrector(
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=chat_model,
+                    target=target,
+                    step=step,
+                    active_title=active_title,
+                    active_goal=active_goal,
+                    active_signal=active_signal,
+                    active_action=active_action,
+                    controller_reflection=controller_reflection,
+                    recommender=recommender_plan,
+                    available_actions_text=actions_text,
+                    memory_summary=memory_summary,
+                    recent_history=short_history(history),
+                )
+                plan, judge = choose_final_proposal(
+                    recommender=recommender_plan,
+                    corrector=corrector_review,
+                    active_action=active_action,
+                )
+            flush_run_state("post_decision")
             capability = resolve_capability_gap(
                 proposal=plan,
                 active_action=active_action,
@@ -652,23 +860,109 @@ def main() -> None:
                 print(f"[step {step}] plan: {analysis[:180]} (conf={confidence:.2f})")
 
             if decision == "done":
-                done = True
-                final_report = "Model decided challenge solved."
-                memory.finish_subtask_state(
-                subtask_state_id,
-                status="finished",
-                command="__model_done__",
-                return_code=0,
-                info_gain=0.0,
-            )
-                break
+                solved_markers = [
+                    str(memory.get_fact("flag.last") or "").strip(),
+                    str(memory.get_fact("flag.candidate") or "").strip(),
+                    str(memory.get_fact("flag.confirmed") or "").strip(),
+                ]
+                has_solved_evidence = any(marker for marker in solved_markers)
+                if has_solved_evidence:
+                    done = True
+                    final_report = "Model decided challenge solved."
+                    memory.finish_subtask_state(
+                        subtask_state_id,
+                        status="finished",
+                        command="__model_done__",
+                        return_code=0,
+                        info_gain=0.0,
+                    )
+                    flush_run_state("model_done")
+                    break
+                memory.add_event(step, "unsafe_done_rewrite", "rewrote model done decision without solved evidence")
+                memory.upsert_fact("error.tactical.unsafe_done", "true", 0.96, step)
+                if active_action:
+                    decision = "action"
+                    action_obj = {"name": active_action, "args": {}}
+                    confidence = min(confidence, 0.45)
+                    analysis = analysis or f"Unsafe done rewritten to planner action {active_action}."
+                    success_signal = success_signal or active_signal
+                else:
+                    decision = "command"
+                    fallback_cmd = str(plan.get("next_if_fail", "")).replace("{target}", target).strip()
+                    if not fallback_cmd:
+                        fallback_cmd = str(plan.get("command", "")).replace("{target}", target).strip()
+                    plan["command"] = fallback_cmd or "curl -si $TARGET_URL/"
+                    confidence = min(confidence, 0.35)
+                    analysis = analysis or "Unsafe done rewritten to fallback command."
 
             raw_cmd = str(plan.get("command", "")).replace("{target}", target).strip()
             action_obj = plan.get("action", {})
+            active_action_name = ""
+            if isinstance(action_obj, dict):
+                active_action_name = canonical_action_name(str(action_obj.get("name", "")).strip())
             if decision == "action":
-                action_spec = validate_action_spec(action_obj if isinstance(action_obj, dict) else {}, memory)
-                raw_cmd = compile_action_command(action_spec, memory)
+                try:
+                    action_spec = validate_action_spec(action_obj if isinstance(action_obj, dict) else {}, memory)
+                    raw_cmd = compile_action_command(action_spec, memory)
+                    active_action_name = canonical_action_name(str(action_spec.get("name", "")).strip())
+                    phase = suggested_phase_for_action(active_action_name, phase)
+                except Exception as exc:
+                    decision = "command"
+                    fallback_cmd = str(plan.get("command", "")).replace("{target}", target).strip()
+                    if not fallback_cmd:
+                        fallback_cmd = str(plan.get("next_if_fail", "")).replace("{target}", target).strip()
+                    raw_cmd = fallback_cmd or "curl -si $TARGET_URL/"
+                    memory.add_event(step, "invalid_action_fallback", str(exc)[:300])
             cmd = validate_command(repair_helper_command(raw_cmd, memory))
+            preflight = preflight_command_quality(
+                command=cmd,
+                action_name=active_action_name,
+                memory=memory,
+                env=env,
+                cwd=artifact_dir,
+            )
+            for key, value, conf in preflight.get("facts", []):
+                memory.upsert_fact(key, value, conf, step)
+            if preflight.get("autofixed"):
+                fixed_cmd = str(preflight.get("command", cmd)).strip()
+                if fixed_cmd and fixed_cmd != cmd:
+                    memory.add_event(step, "preflight_autofix", fixed_cmd[:300])
+                    cmd = fixed_cmd
+            if not bool(preflight.get("ok", True)):
+                reason = "; ".join([str(x).strip() for x in preflight.get("issues", []) if str(x).strip()][:3]) or "preflight quality check failed"
+                memory.add_event(step, "preflight_block", reason[:300])
+                memory.upsert_fact("error.preflight.last", reason[:220], 0.96, step)
+                if is_collab_mode:
+                    fallback_cmd = str(plan.get("next_if_fail", "")).replace("{target}", target).strip() or "curl -si $TARGET_URL/"
+                    cmd = validate_command(repair_helper_command(fallback_cmd))
+                    memory.add_event(step, "preflight_soft_bypass", f"{reason[:200]} | fallback={cmd[:140]}")
+                    log_dialogue(step, "preflight_soft_bypass", {"reason": reason, "fallback_cmd": cmd})
+                else:
+                    history.append(
+                    {
+                        "step": step,
+                        "phase": phase,
+                        "analysis": analysis,
+                        "confidence": confidence,
+                        "command": cmd,
+                        "signal": f"blocked-by-preflight: {reason}",
+                    }
+                )
+                    memory.finish_subtask_state(
+                    subtask_state_id,
+                    status="failed",
+                    command=cmd,
+                    return_code=1,
+                    info_gain=0.0,
+                    error=f"blocked-by-preflight: {reason}",
+                )
+                    print(f"[step {step}] preflight blocked action: {reason}")
+                    flush_run_state("preflight_blocked")
+                    time.sleep(0.2)
+                    continue
+            preflight_warnings = [str(x).strip() for x in preflight.get("warnings", []) if str(x).strip()]
+            if preflight_warnings:
+                memory.add_event(step, "preflight_warn", " | ".join(preflight_warnings)[:300])
             if require_signal and not success_signal:
                 history.append(
                 {
@@ -690,39 +984,48 @@ def main() -> None:
                 error="blocked-by-controller: missing success_signal",
             )
                 print(f"[step {step}] controller blocked action: missing success_signal")
+                flush_run_state("controller_blocked")
                 time.sleep(0.2)
                 continue
-            ok, reason = validate_action(
-            phase=phase,
-            expected_phase=expected_phase,
-            command=cmd,
-            memory=memory,
-            history=history,
-                controller_reflection=controller_reflection,
-            )
-            if not ok:
-                history.append(
-                {
-                    "step": step,
-                    "phase": phase,
-                    "analysis": analysis,
-                    "confidence": confidence,
-                    "command": cmd,
-                    "signal": f"blocked-by-validator: {reason}",
-                }
-            )
-                memory.add_event(step, "validator_block", reason)
-                memory.finish_subtask_state(
-                subtask_state_id,
-                status="failed",
+            if not is_collab_mode:
+                validator_policy = (
+                    {}
+                    if args.solver_mode == "codex_pure"
+                    else (controller_reflection if args.solver_mode == "legacy" else soften_controller_for_codex(controller_reflection))
+                )
+                ok, reason = validate_action(
+                phase=phase,
+                expected_phase=expected_phase,
                 command=cmd,
-                return_code=1,
-                info_gain=0.0,
-                error=f"blocked-by-validator: {reason}",
-            )
-                print(f"[step {step}] validator blocked action: {reason}")
-                time.sleep(0.2)
-                continue
+                    memory=memory,
+                    history=history,
+                    controller_reflection=validator_policy,
+                    action_name=active_action_name,
+                )
+                if not ok:
+                    history.append(
+                    {
+                        "step": step,
+                        "phase": phase,
+                        "analysis": analysis,
+                        "confidence": confidence,
+                        "command": cmd,
+                        "signal": f"blocked-by-validator: {reason}",
+                    }
+                )
+                    memory.add_event(step, "validator_block", reason)
+                    memory.finish_subtask_state(
+                    subtask_state_id,
+                    status="failed",
+                    command=cmd,
+                    return_code=1,
+                    info_gain=0.0,
+                    error=f"blocked-by-validator: {reason}",
+                )
+                    print(f"[step {step}] validator blocked action: {reason}")
+                    flush_run_state("validator_blocked")
+                    time.sleep(0.2)
+                    continue
 
             cmd_key = normalize_command(cmd)
             command_seen[cmd_key] = command_seen.get(cmd_key, 0) + 1
@@ -747,6 +1050,7 @@ def main() -> None:
                 error="skipped-duplicate-command",
             )
                 print(f"[step {step}] skipped duplicate command")
+                flush_run_state("duplicate_skipped")
                 time.sleep(0.2)
                 continue
 
@@ -754,17 +1058,19 @@ def main() -> None:
             step=step,
             phase=phase,
             tool_name="call",
-            payload={"command": cmd, "timeout_sec": args.cmd_timeout},
+            payload={"command": cmd, "timeout_sec": min(args.cmd_timeout, int(gain_policy.get("timeout_cap_sec", 0) or args.cmd_timeout))},
         )
-            result = run_shell_command(cmd, timeout=args.cmd_timeout, env=env, cwd=artifact_dir)
+            exec_timeout = min(args.cmd_timeout, int(gain_policy.get("timeout_cap_sec", 0) or args.cmd_timeout))
+            flush_run_state("pre_execute")
+            result = run_shell_command(cmd, timeout=exec_timeout, env=env, cwd=artifact_dir)
             stdout_clean = strip_noise(result["stdout"])
             stderr_clean = strip_noise(result["stderr"])
             merged = (stdout_clean + "\n" + stderr_clean)[:120000]
             flag_matches = [m.group(0) for m in FLAG_RE.finditer(merged)]
-            signal = f"rc={result['returncode']}"
+            outcome_signal = f"rc={result['returncode']}"
             if flag_matches:
                 found_flag = flag_matches[0]
-                signal += f"; flag={found_flag}"
+                outcome_signal += f"; flag={found_flag}"
                 done = True
                 final_report = f"Flag found in command output: {found_flag}"
 
@@ -794,7 +1100,7 @@ def main() -> None:
         )
 
             memory.add_event(step, "command", cmd)
-            memory.add_event(step, "signal", signal)
+            memory.add_event(step, "signal", outcome_signal)
             memory.add_event(step, "info_gain", str(gain))
             memory.add_tool_event(
             step=step,
@@ -804,7 +1110,7 @@ def main() -> None:
                 "command": cmd,
                 "returncode": result["returncode"],
                 "elapsed_sec": result["elapsed_sec"],
-                "signal": signal,
+                "signal": outcome_signal,
                 "info_gain": gain,
             },
         )
@@ -832,16 +1138,18 @@ def main() -> None:
             "next_if_fail": next_if_fail,
             "returncode": result["returncode"],
             "elapsed_sec": result["elapsed_sec"],
-            "signal": signal,
+            "signal": outcome_signal,
             "info_gain": gain,
             "reflection": reflection,
             "hypothesis_updates": hypothesis_updates,
             "controller_reflection": controller_reflection,
             "recommender": recommender_plan,
             "corrector": corrector_review,
+            "counter_solver": counter_solver_notes,
             "judge": judge,
             "capability": capability,
             "logistics": logistics,
+            "preflight": preflight,
             "stdout_head": stdout_clean[:2000],
             "stderr_head": stderr_clean[:1200],
             }
@@ -862,6 +1170,7 @@ def main() -> None:
                 entry["plan_after"] = current_plan
                 memory.add_event(step, "plan_patch", json.dumps(plan_patch, ensure_ascii=False)[:3000])
             print(f"[step {step}] {phase} rc={result['returncode']} cmd={cmd[:120]}")
+            flush_run_state("post_execute")
 
             if done:
                 break
@@ -888,29 +1197,7 @@ def main() -> None:
         step_end=max(0, len(history)),
     )
     memory.set_flow_status("finished" if run_success else "failed")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    run_obj = {
-        "timestamp": utc_now_z(),
-        "run_id": run_id,
-        "target": target,
-        "objective": args.objective,
-        "hint": args.hint,
-        "model": chat_model,
-        "memory_db": str(memory_db_path),
-        "artifact_dir": str(artifact_dir),
-        "tools": tools,
-        "memory_facts": memory.export_facts(),
-        "execution_state": memory.export_execution_state(),
-        "steps": history,
-        "challenge_steps": len(history),
-        "capability_steps": capability_steps,
-        "capability_history": capability_history,
-        "done": done,
-        "flag": found_flag,
-        "final_report": final_report,
-    }
-    out_path.write_text(json.dumps(run_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    flush_run_state("finalized", final=True)
 
     print("\n=== Final Report ===")
     print(final_report)
