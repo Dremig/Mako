@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import sqlite3
@@ -143,6 +144,15 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "jsp_name": "--jsp-name",
         },
     },
+}
+ACTION_PHASE_HINTS: dict[str, str] = {
+    "http_probe_with_baseline": "recon",
+    "extract_html_attack_surface": "extract",
+    "cookiejar_flow_fetch": "probe",
+    "service_recovery_probe": "probe",
+    "multipart_upload_with_known_action": "exploit",
+    "build_jsp_war": "extract",
+    "tomcat_manager_read_file": "extract",
 }
 
 FAILURE_CLUSTERS = {
@@ -571,6 +581,99 @@ def available_actions_summary() -> str:
     return "\n".join(rows) if rows else "none"
 
 
+def canonical_action_name(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if raw in ACTION_SCHEMAS:
+        return raw
+    head = raw.split("(", 1)[0].strip()
+    if head in ACTION_SCHEMAS:
+        return head
+    for name in ACTION_SCHEMAS:
+        if re.search(rf"\b{re.escape(name)}\b", raw):
+            return name
+    return ""
+
+
+def infer_action_name_from_command(command: str) -> str:
+    lower = command.lower()
+    for name, schema in ACTION_SCHEMAS.items():
+        script = str(schema.get("script", ""))
+        marker = Path(script).name.lower()
+        if marker and marker in lower:
+            return name
+    return ""
+
+
+def suggested_phase_for_action(action_name: str, current_phase: str) -> str:
+    canonical = canonical_action_name(action_name)
+    if not canonical:
+        return current_phase
+    hint = ACTION_PHASE_HINTS.get(canonical, "")
+    return hint or current_phase
+
+
+def _best_html_artifact_path(memory: MemoryStore) -> str:
+    preset = str(memory.get_fact("artifact.html_file") or "").strip()
+    if preset and Path(preset).exists():
+        return preset
+    artifact_dir_raw = str(memory.get_fact("artifact.dir") or "").strip()
+    if not artifact_dir_raw:
+        return preset
+    artifact_dir = Path(artifact_dir_raw)
+    if not artifact_dir.exists():
+        return preset
+    preferred = [
+        "root.html",
+        "root.body",
+        "root.body.html",
+        "homepage.html",
+        "home_body.html",
+        "index.html",
+    ]
+    for name in preferred:
+        candidate = artifact_dir / name
+        if candidate.exists() and candidate.is_file():
+            return str(candidate)
+    html_candidates = sorted(
+        [p for p in artifact_dir.glob("*.html") if p.is_file()],
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if html_candidates:
+        return str(html_candidates[0])
+    return preset
+
+
+def _resolve_existing_html_path(candidate: str, memory: MemoryStore, env: dict[str, str]) -> str:
+    raw = str(candidate or "").strip()
+    if not raw:
+        return ""
+    expanded = _expand_env_like(raw, env)
+    direct = Path(expanded)
+    if direct.exists() and direct.is_file():
+        return raw
+
+    near_candidates: list[Path] = []
+    if direct.suffix:
+        near_candidates.append(direct.with_suffix(".html"))
+        near_candidates.append(direct.with_suffix(".htm"))
+    else:
+        near_candidates.append(Path(expanded + ".html"))
+        near_candidates.append(Path(expanded + ".htm"))
+
+    for alt in near_candidates:
+        if alt.exists() and alt.is_file():
+            return str(alt)
+
+    best = _best_html_artifact_path(memory)
+    best_expanded = _expand_env_like(best, env) if best else ""
+    if best and best_expanded and Path(best_expanded).exists() and Path(best_expanded).is_file():
+        return best
+    return ""
+
+
 def action_defaults(name: str, memory: MemoryStore) -> dict[str, str]:
     if name == "http_probe_with_baseline":
         target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
@@ -583,7 +686,7 @@ def action_defaults(name: str, memory: MemoryStore) -> dict[str, str]:
     if name == "extract_html_attack_surface":
         target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
         artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
-        html_file = memory.get_fact("artifact.html_file") or str(Path(artifact_dir) / "root.body")
+        html_file = _best_html_artifact_path(memory) or str(Path(artifact_dir) / "root.body")
         return {
             "html_file": html_file,
             "base_url": target,
@@ -771,6 +874,127 @@ def repair_helper_command(command: str, memory: MemoryStore) -> str:
     return repaired
 
 
+def _expand_env_like(text: str, env: dict[str, str]) -> str:
+    def repl(match: re.Match[str]) -> str:
+        brace = match.group(1)
+        plain = match.group(2)
+        key = (brace or plain or "").strip()
+        if not key:
+            return match.group(0)
+        return env.get(key, os.getenv(key, match.group(0)))
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)", repl, text)
+
+
+def _token_flag_value(tokens: list[str], flag: str) -> tuple[int, str]:
+    for idx, token in enumerate(tokens):
+        if token == flag and idx + 1 < len(tokens):
+            return idx + 1, tokens[idx + 1]
+        if token.startswith(flag + "="):
+            return idx, token.split("=", 1)[1]
+    return -1, ""
+
+
+def preflight_command_quality(
+    *,
+    command: str,
+    action_name: str,
+    memory: MemoryStore,
+    env: dict[str, str],
+    cwd: Path,
+) -> dict[str, Any]:
+    cmd = command.strip()
+    issues: list[str] = []
+    warnings: list[str] = []
+    facts: list[tuple[str, str, float]] = []
+    autofixed = False
+
+    if not cmd:
+        return {"ok": False, "command": cmd, "issues": ["empty command"], "warnings": warnings, "facts": facts, "autofixed": autofixed}
+
+    syntax_probe = subprocess.run(
+        ["bash", "-n", "-c", cmd],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(cwd),
+        env=env,
+    )
+    if syntax_probe.returncode != 0:
+        detail = strip_noise((syntax_probe.stderr or syntax_probe.stdout).strip())[:280]
+        issues.append(f"shell syntax check failed: {detail or 'bash -n failed'}")
+        facts.append(("error.preflight.shell_syntax", "true", 0.98))
+        return {"ok": False, "command": cmd, "issues": issues, "warnings": warnings, "facts": facts, "autofixed": autofixed}
+
+    if ("python" in cmd and "<<" in cmd) and re.search(r"\bexport\s+[A-Za-z_][A-Za-z0-9_]*=", cmd):
+        issues.append("python heredoc contains shell-style export assignment")
+        facts.append(("error.preflight.python_heredoc_export", "true", 0.97))
+        return {"ok": False, "command": cmd, "issues": issues, "warnings": warnings, "facts": facts, "autofixed": autofixed}
+
+    if re.search(r"\bbash\s+-lc\b", cmd) and re.search(r"\bpython3?\s+-\s*<<", cmd):
+        issues.append("fragile python heredoc nested inside bash -lc")
+        facts.append(("error.preflight.fragile_python_heredoc", "true", 0.97))
+        return {"ok": False, "command": cmd, "issues": issues, "warnings": warnings, "facts": facts, "autofixed": autofixed}
+
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError as exc:
+        issues.append(f"command tokenization failed: {exc}")
+        facts.append(("error.preflight.tokenize_failed", "true", 0.97))
+        return {"ok": False, "command": cmd, "issues": issues, "warnings": warnings, "facts": facts, "autofixed": autofixed}
+
+    if len(tokens) >= 2 and tokens[0].startswith("python") and tokens[1].endswith(".py"):
+        script_expanded = _expand_env_like(tokens[1], env)
+        if not Path(script_expanded).exists():
+            issues.append(f"python script not found: {script_expanded}")
+            facts.append(("error.preflight.script_not_found", "true", 0.98))
+            return {"ok": False, "command": cmd, "issues": issues, "warnings": warnings, "facts": facts, "autofixed": autofixed}
+
+    command_action = canonical_action_name(action_name) or infer_action_name_from_command(cmd)
+    if command_action == "extract_html_attack_surface":
+        html_idx, html_val = _token_flag_value(tokens, "--html-file")
+        html_expanded = _expand_env_like(html_val, env) if html_val else ""
+        if not html_val:
+            issues.append("extract_html_attack_surface missing --html-file")
+            facts.append(("error.preflight.missing_html_file_arg", "true", 0.98))
+            return {"ok": False, "command": cmd, "issues": issues, "warnings": warnings, "facts": facts, "autofixed": autofixed}
+        if not Path(html_expanded).exists():
+            best = _resolve_existing_html_path(html_val, memory, env)
+            best_expanded = _expand_env_like(best, env) if best else ""
+            if best and best_expanded and Path(best_expanded).exists() and html_idx >= 0:
+                if tokens[html_idx].startswith("--html-file="):
+                    tokens[html_idx] = f"--html-file={best}"
+                else:
+                    tokens[html_idx] = best
+                cmd = shlex.join(tokens)
+                autofixed = True
+                warnings.append(f"replaced missing html file path with existing artifact: {best}")
+                facts.append(("preflight.autofix.html_file", best[:220], 0.92))
+            else:
+                issues.append(f"html file not found: {html_expanded or html_val}")
+                facts.append(("error.preflight.html_file_not_found", "true", 0.98))
+                return {"ok": False, "command": cmd, "issues": issues, "warnings": warnings, "facts": facts, "autofixed": autofixed}
+
+    if "curl" in cmd and "http" in cmd:
+        m = re.search(r"(https?://[^\s\"'`]+)", cmd)
+        if m:
+            url = m.group(1)
+            probe = subprocess.run(
+                ["curl", "-m", "4", "-k", "-sS", "-o", "/dev/null", "-w", "%{http_code}", url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=str(cwd),
+                env=env,
+            )
+            code = (probe.stdout or "").strip()
+            if probe.returncode != 0 or not code or code == "000":
+                warnings.append(f"curl canary failed for {url}: rc={probe.returncode}, code={code or 'none'}")
+                facts.append(("warning.preflight.curl_canary_failed", "true", 0.78))
+
+    return {"ok": True, "command": cmd, "issues": issues, "warnings": warnings, "facts": facts, "autofixed": autofixed}
+
+
 def strip_noise(text: str) -> str:
     out_lines: list[str] = []
     for line in text.splitlines():
@@ -903,6 +1127,65 @@ def extract_relative_paths(text: str) -> list[str]:
     return out
 
 
+_STATIC_ASSET_RE = re.compile(r"\.(?:css|js|png|jpg|jpeg|gif|svg|ico|woff2?|ttf|map)(?:\?|$)", re.IGNORECASE)
+_AUTH_HINT_RE = re.compile(r"(login|auth|admin|account|session|user|profile|note|flag)", re.IGNORECASE)
+
+
+def _normalize_focus_path(raw: str) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(text)
+    except ValueError:
+        return text
+    if parsed.scheme and parsed.netloc:
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        return path
+    return text
+
+
+def _is_low_value_focus(path: str) -> bool:
+    val = _normalize_focus_path(path)
+    if not val or val == "/":
+        return True
+    if val.startswith(("/packages/", "/app/")):
+        return True
+    return bool(_STATIC_ASSET_RE.search(val))
+
+
+def _focus_priority(path: str) -> int:
+    val = _normalize_focus_path(path)
+    if not val:
+        return -1
+    if _is_low_value_focus(val):
+        return 1
+    score = 5
+    if _AUTH_HINT_RE.search(val):
+        score += 5
+    if val.startswith("/api/"):
+        score += 2
+    return score
+
+
+def _pick_focus_path(candidate_paths: list[str], form_actions: list[str]) -> str:
+    ranked: list[tuple[int, str]] = []
+    for raw in form_actions + candidate_paths:
+        val = _normalize_focus_path(raw)
+        if not val:
+            continue
+        ranked.append((_focus_priority(val), val))
+    if not ranked:
+        return ""
+    ranked.sort(key=lambda item: (item[0], -len(item[1])), reverse=True)
+    best_score, best_path = ranked[0]
+    if best_score <= 1:
+        return ""
+    return best_path[:180]
+
+
 def _load_action_json(stdout: str) -> dict[str, Any] | None:
     raw = stdout.strip()
     if not raw or not raw.startswith("{"):
@@ -921,7 +1204,42 @@ def extract_structured_action_facts(command: str, stdout: str) -> list[tuple[str
 
     facts: list[tuple[str, str, float]] = []
 
+    if "http_probe_with_baseline.py" in command:
+        probe = payload.get("probe", {})
+        if isinstance(probe, dict):
+            status = str(probe.get("status", "")).strip()
+            if status.isdigit():
+                facts.append(("http.last_status", status, 0.92))
+        artifacts = payload.get("artifacts", {})
+        if isinstance(artifacts, dict):
+            body_file = str(artifacts.get("body_file", "")).strip()
+            body_html_file = str(artifacts.get("body_html_file", "")).strip()
+            headers_file = str(artifacts.get("headers_file", "")).strip()
+            cookies_file = str(artifacts.get("cookies_file", "")).strip()
+            artifact_dir = str(artifacts.get("artifact_dir", "")).strip()
+            if body_file:
+                facts.append(("artifact.body_file", body_file[:220], 0.94))
+            if body_html_file:
+                facts.append(("artifact.html_file", body_html_file[:220], 0.96))
+            elif body_file:
+                facts.append(("artifact.html_file", body_file[:220], 0.92))
+            if headers_file:
+                facts.append(("artifact.headers_file", headers_file[:220], 0.92))
+            if cookies_file:
+                facts.append(("artifact.cookies_file", cookies_file[:220], 0.90))
+            if artifact_dir:
+                facts.append(("artifact.dir", artifact_dir[:220], 0.90))
+
     if "extract_html_attack_surface.py" in command:
+        forms = payload.get("forms", [])
+        form_actions: list[str] = []
+        if isinstance(forms, list):
+            for item in forms[:10]:
+                if isinstance(item, dict):
+                    action = str(item.get("action", "")).strip()
+                    if action:
+                        form_actions.append(action)
+
         paths = payload.get("candidate_paths", [])
         if isinstance(paths, list):
             for raw in paths[:40]:
@@ -930,10 +1248,13 @@ def extract_structured_action_facts(command: str, stdout: str) -> list[tuple[str
                     continue
                 path_hash = hashlib.md5(value.encode("utf-8")).hexdigest()[:8]
                 facts.append((f"endpoint.candidate.{path_hash}", value[:180], 0.93))
-            if paths:
-                facts.append(("endpoint.focus", str(paths[0]).strip()[:180], 0.91))
+        focus = _pick_focus_path(
+            [str(raw).strip() for raw in paths[:40]] if isinstance(paths, list) else [],
+            form_actions,
+        )
+        if focus:
+            facts.append(("endpoint.focus", focus, 0.93))
 
-        forms = payload.get("forms", [])
         if isinstance(forms, list):
             for index, item in enumerate(forms[:10], start=1):
                 if not isinstance(item, dict):
@@ -1116,7 +1437,7 @@ def extract_facts(command: str, stdout: str, stderr: str) -> list[tuple[str, str
         facts.append(("error.semantic.missing_required_parameter", "true", 0.96))
         norm = required_names[0].replace(" ", "_").replace("-", "_")
         facts.append(("error.required_parameter", norm[:64], 0.96))
-        if request_paths:
+        if request_paths and not _is_low_value_focus(request_paths[0]):
             facts.append(("endpoint.focus", request_paths[0], 0.90))
 
     dbms_match = re.search(r"back-end DBMS:\s*([^\n\r]+)", merged, re.IGNORECASE)
@@ -1139,6 +1460,25 @@ def extract_facts(command: str, stdout: str, stderr: str) -> list[tuple[str, str
         facts.append(("debug.traceback_exposed", "true", 0.96))
     if re.search(r"jsondecodeerror", merged, re.IGNORECASE):
         facts.append(("parser.json_error", "true", 0.94))
+
+    # Source or traceback excerpts that expose the auth query shape should strongly bias toward SQLi.
+    if re.search(r"select\s+rowid\s+from\s+users\s+where\s+uname\s*=\s*'.*'\s+and\s+pass\s*=", merged, re.IGNORECASE):
+        facts.append(("vuln.signal.sqli", "true", 0.94))
+        facts.append(("debug.auth_query.sql_username_password", "true", 0.95))
+        facts.append(("dbms", "sqlite", 0.86))
+        facts.append(("injection.parameter", "username", 0.88))
+        facts.append(("injection.method", "POST", 0.88))
+        facts.append(("entrypoint.confirmed.username", "POST", 0.90))
+    if re.search(r"replace\(\s*['\"]admin['\"]\s*,\s*['\"]['\"]\s*\)", merged, re.IGNORECASE):
+        facts.append(("filter.username_strip_admin", "true", 0.92))
+    if re.search(r"trim_whitespace\s*\(\s*req\.body\.username\s*\)", merged, re.IGNORECASE):
+        facts.append(("filter.username_whitespace_trim", "true", 0.92))
+        facts.append(("entrypoint.confirmed.username", "POST", 0.88))
+    if re.search(r"trim_whitespace\s*\(\s*req\.body\.password\s*\)", merged, re.IGNORECASE):
+        facts.append(("filter.password_whitespace_trim", "true", 0.92))
+        facts.append(("entrypoint.confirmed.password", "POST", 0.88))
+    if re.search(r"single\s+line\s+comment\s+indicator|--", merged, re.IGNORECASE) and re.search(r"sql|query|select|where", merged, re.IGNORECASE):
+        facts.append(("technique.sql_comment_bypass", "true", 0.88))
 
     for vuln in detect_vuln_signals(merged):
         facts.append((f"vuln.signal.{vuln}", "true", 0.78))
@@ -1278,6 +1618,15 @@ def derive_phase_state(memory: MemoryStore, history: list[dict[str, Any]]) -> tu
         constraints.append("Tomcat upload action is known; reuse the exact upload action path and the same cookie jar from the authenticated manager page.")
     if memory.get_fact("artifact.war_path"):
         constraints.append("A WAR artifact path is already known; reuse that stable WAR file instead of rebuilding it in a random temp directory.")
+    if memory.get_fact("debug.auth_query.sql_username_password") == "true":
+        phase = "exploit" if phase in {"recon", "probe"} else phase
+        constraints.append("Source or traceback exposed a SQL auth query on username/password; prioritize SQL injection over NoSQL-style payloads.")
+    if memory.get_fact("filter.username_strip_admin") == "true":
+        constraints.append("Username input strips the literal substring 'admin'; consider duplication or overlap tricks rather than raw 'admin'.")
+    if memory.get_fact("filter.username_whitespace_trim") == "true" or memory.get_fact("filter.password_whitespace_trim") == "true":
+        constraints.append("Whitespace and percent-space are trimmed from auth inputs; avoid space-dependent SQLi payloads.")
+    if memory.get_fact("technique.sql_comment_bypass") == "true":
+        constraints.append("A SQL single-line comment style bypass is plausible; test compact username-only SQLi payloads that avoid spaces.")
 
     recent_same = 0
     if history:
@@ -1302,6 +1651,185 @@ def info_gain_score(memory: MemoryStore, new_facts: list[tuple[str, str, float]]
         elif prev != value:
             score += 2
     return score
+
+
+def gain_window_summary(history: list[dict[str, Any]], window: int = 6) -> dict[str, Any]:
+    if not history:
+        return {
+            "recent_count": 0,
+            "recent_total_gain": 0.0,
+            "recent_avg_gain": 0.0,
+            "low_gain_streak": 0,
+            "same_family_low_gain_streak": 0,
+            "last_family": "",
+        }
+    tail = history[-max(1, int(window)) :]
+    recent_gains = [float(item.get("info_gain", 0) or 0) for item in tail]
+    recent_total = sum(recent_gains)
+    recent_avg = recent_total / max(1, len(recent_gains))
+
+    low_gain_streak = 0
+    for item in reversed(history):
+        gain = float(item.get("info_gain", 0) or 0)
+        if gain <= 1.0:
+            low_gain_streak += 1
+            continue
+        break
+
+    last_family = _command_family(str(history[-1].get("command", ""))) if history else ""
+    same_family_low_gain = 0
+    if last_family:
+        for item in reversed(history):
+            family = _command_family(str(item.get("command", "")))
+            gain = float(item.get("info_gain", 0) or 0)
+            if family == last_family and gain <= 1.0:
+                same_family_low_gain += 1
+                continue
+            break
+
+    return {
+        "recent_count": len(tail),
+        "recent_total_gain": recent_total,
+        "recent_avg_gain": recent_avg,
+        "low_gain_streak": low_gain_streak,
+        "same_family_low_gain_streak": same_family_low_gain,
+        "last_family": last_family,
+    }
+
+
+def derive_gain_budget_policy(
+    *,
+    history: list[dict[str, Any]],
+    expected_phase: str,
+) -> dict[str, Any]:
+    summary = gain_window_summary(history)
+    recent_count = int(summary["recent_count"])
+    recent_total = float(summary["recent_total_gain"])
+    recent_avg = float(summary["recent_avg_gain"])
+    low_gain_streak = int(summary["low_gain_streak"])
+    same_family_low_gain_streak = int(summary["same_family_low_gain_streak"])
+    last_family = str(summary["last_family"])
+
+    policy = {
+        "breach": False,
+        "severity": "none",
+        "failure_cluster": "none",
+        "phase_override": "",
+        "must_do": [],
+        "must_avoid": [],
+        "requirements": {
+            "change_command_family": False,
+            "require_explicit_success_signal": False,
+            "force_plan_refresh": False,
+            "force_branch_shift": False,
+        },
+        "timeout_cap_sec": 0,
+        "rationale": "",
+        "summary": summary,
+    }
+
+    if low_gain_streak >= 4 or (recent_count >= 6 and recent_total <= 3.0):
+        policy["breach"] = True
+        policy["severity"] = "hard"
+        policy["failure_cluster"] = "low_gain_loop"
+        policy["requirements"]["change_command_family"] = True
+        policy["requirements"]["require_explicit_success_signal"] = True
+        policy["requirements"]["force_plan_refresh"] = True
+        policy["requirements"]["force_branch_shift"] = True
+        policy["timeout_cap_sec"] = 20
+        policy["must_do"] = [
+            "Force a branch shift: retire the current subtask and replan from the strongest remaining evidence.",
+            "Use one short command with a concrete expected signal instead of another broad probe.",
+        ]
+        policy["must_avoid"] = [
+            "Do not continue the same low-gain route after repeated weak steps.",
+            "Do not spend another long timeout on the current strategy family.",
+        ]
+        policy["rationale"] = (
+            f"Hard low-gain budget breach: streak={low_gain_streak}, "
+            f"recent_total={recent_total:.2f}, recent_avg={recent_avg:.2f}."
+        )
+        return policy
+
+    if low_gain_streak >= 3 or same_family_low_gain_streak >= 2:
+        policy["breach"] = True
+        policy["severity"] = "soft"
+        policy["failure_cluster"] = "low_gain_loop"
+        policy["requirements"]["change_command_family"] = True
+        policy["requirements"]["require_explicit_success_signal"] = True
+        policy["requirements"]["force_plan_refresh"] = True
+        policy["timeout_cap_sec"] = 30 if expected_phase in {"recon", "probe"} else 20
+        policy["must_do"] = [
+            "Change action style or target a different observable signal on the next step.",
+            "Prefer a shorter, more diagnostic command before another expensive probe.",
+        ]
+        policy["must_avoid"] = [
+            "Do not repeat the same low-gain command family immediately.",
+        ]
+        if last_family:
+            policy["must_avoid"].append(f"Do not reuse command family `{last_family}` on the next step.")
+        policy["rationale"] = (
+            f"Soft low-gain budget breach: streak={low_gain_streak}, "
+            f"same_family_streak={same_family_low_gain_streak}, recent_avg={recent_avg:.2f}."
+        )
+    return policy
+
+
+def merge_controller_with_gain_policy(
+    controller_reflection: dict[str, Any],
+    gain_policy: dict[str, Any],
+) -> dict[str, Any]:
+    out = dict(controller_reflection or {})
+    requirements = dict(out.get("requirements", {}) if isinstance(out.get("requirements"), dict) else {})
+    gain_requirements = gain_policy.get("requirements", {}) if isinstance(gain_policy.get("requirements"), dict) else {}
+    for key, value in gain_requirements.items():
+        if bool(value):
+            requirements[key] = True
+    out["requirements"] = requirements
+
+    must_do = [str(item).strip() for item in out.get("must_do", []) if str(item).strip()]
+    must_avoid = [str(item).strip() for item in out.get("must_avoid", []) if str(item).strip()]
+    must_do.extend([str(item).strip() for item in gain_policy.get("must_do", []) if str(item).strip()])
+    must_avoid.extend([str(item).strip() for item in gain_policy.get("must_avoid", []) if str(item).strip()])
+
+    def _dedupe(values: list[str]) -> list[str]:
+        seen: set[str] = set()
+        out_vals: list[str] = []
+        for item in values:
+            if item and item not in seen:
+                seen.add(item)
+                out_vals.append(item[:220])
+        return out_vals[:5]
+
+    out["must_do"] = _dedupe(must_do)
+    out["must_avoid"] = _dedupe(must_avoid)
+
+    if gain_policy.get("breach"):
+        out["failure_cluster"] = str(gain_policy.get("failure_cluster", "low_gain_loop")).strip().lower() or "low_gain_loop"
+    if gain_policy.get("phase_override"):
+        out["phase_override"] = str(gain_policy.get("phase_override", "")).strip().lower()
+
+    rationale_bits = [str(out.get("rationale", "")).strip(), str(gain_policy.get("rationale", "")).strip()]
+    out["rationale"] = " | ".join([bit for bit in rationale_bits if bit])[:500]
+    return out
+
+
+def soften_controller_for_codex(controller_reflection: dict[str, Any]) -> dict[str, Any]:
+    policy = dict(controller_reflection or {})
+    requirements = policy.get("requirements", {}) if isinstance(policy.get("requirements"), dict) else {}
+    return {
+        "phase_override": str(policy.get("phase_override", "")).strip().lower(),
+        "failure_cluster": str(policy.get("failure_cluster", "none")).strip().lower() or "none",
+        "must_do": [],
+        "must_avoid": [],
+        "rationale": str(policy.get("rationale", "")).strip(),
+        "requirements": {
+            "change_command_family": bool(requirements.get("change_command_family", False)),
+            "require_explicit_success_signal": bool(requirements.get("require_explicit_success_signal", False)),
+            "force_plan_refresh": bool(requirements.get("force_plan_refresh", False)),
+            "force_branch_shift": bool(requirements.get("force_branch_shift", False)),
+        },
+    }
 
 
 def _rule_controller_change_command_family(
@@ -1353,11 +1881,14 @@ def _rule_controller_recon_regression(
 def _rule_semantic_recovery_discovery_drift(
     *,
     cmd: str,
+    command_action: str,
     has_missing_required: bool,
     has_method_not_allowed: bool,
     has_auth_required: bool,
     **_: Any,
 ) -> str | None:
+    if command_action in {"extract_html_attack_surface", "service_recovery_probe"}:
+        return None
     patterns = ("robots.txt", "sitemap.xml", ".well-known", "security.txt", "http-enum")
     is_drift = any(p in cmd for p in patterns)
     if (has_missing_required or has_method_not_allowed or has_auth_required) and is_drift:
@@ -1368,10 +1899,13 @@ def _rule_semantic_recovery_discovery_drift(
 def _rule_semantic_missing_required_focus(
     *,
     cmd: str,
+    command_action: str,
     has_missing_required: bool,
     focus_endpoint: str,
     **_: Any,
 ) -> str | None:
+    if command_action in {"extract_html_attack_surface", "service_recovery_probe"}:
+        return None
     if has_missing_required and focus_endpoint and focus_endpoint not in cmd:
         return f"Missing-parameter recovery active; action must focus on {focus_endpoint}."
     return None
@@ -1397,27 +1931,33 @@ def validate_action(
     memory: MemoryStore,
     history: list[dict[str, Any]],
     controller_reflection: dict[str, Any] | None = None,
+    action_name: str = "",
 ) -> tuple[bool, str]:
     cmd = command.lower()
+    command_action = canonical_action_name(action_name) or infer_action_name_from_command(command)
     focus_endpoint = (memory.get_fact("endpoint.focus") or memory.get_fact("endpoint.last") or "").strip().lower()
     has_missing_required = memory.get_fact("error.semantic.missing_required_parameter") == "true"
     has_method_not_allowed = memory.get_fact("error.semantic.method_not_allowed") == "true"
     has_auth_required = memory.get_fact("error.semantic.auth_required") == "true"
 
     has_candidate_entrypoints = memory.has_prefix("entrypoint.candidate.") or memory.has_prefix("endpoint.candidate.")
-    if expected_phase == "probe" and phase == "recon" and has_candidate_entrypoints:
+    critical_structured = command_action in {"extract_html_attack_surface", "service_recovery_probe"}
+    if expected_phase == "probe" and phase == "recon" and has_candidate_entrypoints and not critical_structured:
         return False, "Known entrypoint candidates exist; recon should not continue."
-    if expected_phase in {"exploit", "extract"} and phase == "recon":
+    if expected_phase in {"exploit", "extract"} and phase == "recon" and not critical_structured:
         return False, "A stronger signal exists; recon is no longer the best action."
     if has_candidate_entrypoints and "sed -n" in cmd and "/tmp/index.html" in cmd:
         return False, "Re-reading the same page is low information gain after parameters are known."
-    if phase in {"exploit", "extract"} and not (memory.has_prefix("entrypoint.confirmed.") or memory.has_prefix("vuln.signal.")):
+    if phase in {"exploit", "extract"} and not critical_structured and not (
+        memory.has_prefix("entrypoint.confirmed.") or memory.has_prefix("vuln.signal.")
+    ):
         if memory.get_fact("debug.traceback_exposed") != "true" and memory.get_fact("auth.basic.valid") != "true":
             return False, "Exploit/extract requires a confirmed entrypoint or vulnerability signal."
     if history and "skipped-duplicate-command" in str(history[-1].get("signal", "")):
         return False, "Previous action was duplicate-like; choose a materially different command."
     semantic_rule_ctx = {
         "cmd": cmd,
+        "command_action": command_action,
         "has_missing_required": has_missing_required,
         "has_method_not_allowed": has_method_not_allowed,
         "has_auth_required": has_auth_required,
@@ -1781,10 +2321,27 @@ def update_hypotheses(
 
 
 def run_shell_command(command: str, timeout: int, env: dict[str, str], cwd: Path) -> dict[str, Any]:
+    def _auto_export_assignments(text: str) -> str:
+        lines = text.splitlines()
+        out: list[str] = []
+        assign_re = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=(.+)$")
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("export "):
+                out.append(line)
+                continue
+            m = assign_re.match(line)
+            if m and ";" not in line and not stripped.startswith(("for ", "while ", "if ", "local ")):
+                out.append(f"export {line.strip()}")
+            else:
+                out.append(line)
+        return "\n".join(out) if lines else text
+
+    prepared = _auto_export_assignments(command)
     start = time.time()
     try:
         proc = subprocess.run(
-            ["bash", "-lc", command],
+            ["bash", "-lc", prepared],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,

@@ -4,7 +4,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from web_agent.solver_shared import MemoryStore, compile_action_command, extract_facts, validate_action_spec
+from web_agent.solver_shared import (
+    MemoryStore,
+    compile_action_command,
+    extract_facts,
+    preflight_command_quality,
+    validate_action_spec,
+)
 
 
 class StructuredActionTests(unittest.TestCase):
@@ -92,7 +98,7 @@ class StructuredActionTests(unittest.TestCase):
         )
         facts = extract_facts("python3 scripts/extract_html_attack_surface.py --html-file root.body", stdout, "")
         fact_map = {key: value for key, value, _ in facts}
-        self.assertEqual(fact_map["endpoint.focus"], "/api/list")
+        self.assertEqual(fact_map["endpoint.focus"], "/login")
         self.assertEqual(fact_map["entrypoint.candidate.username"], "form-input")
         self.assertEqual(fact_map["form.hidden.csrf"], "abc")
         self.assertIn("/login", fact_map.values())
@@ -108,6 +114,79 @@ class StructuredActionTests(unittest.TestCase):
         self.assertEqual(fact_map["service.tcp.reachable"], "true")
         self.assertEqual(fact_map["service.http.empty_reply"], "true")
         self.assertEqual(fact_map["service.http.error_kind"], "empty_reply")
+
+    def test_extract_facts_parses_http_probe_artifacts(self) -> None:
+        stdout = (
+            '{"baseline":{"status":200,"body_len":10,"elapsed_ms":12},'
+            '"probe":{"status":200,"body_len":10,"elapsed_ms":8},'
+            '"artifacts":{"artifact_dir":"/tmp/a","body_file":"/tmp/a/root.body","body_html_file":"/tmp/a/root.body.html",'
+            '"headers_file":"/tmp/a/root.headers","cookies_file":"/tmp/a/root.cookies.txt"},'
+            '"diff":{"status_diff":0,"body_len_diff":0,"elapsed_ms_diff":-4}}'
+        )
+        facts = extract_facts("python3 scripts/http_probe_with_baseline.py --url http://127.0.0.1:1", stdout, "")
+        fact_map = {key: value for key, value, _ in facts}
+        self.assertEqual(fact_map["artifact.html_file"], "/tmp/a/root.body.html")
+        self.assertEqual(fact_map["artifact.body_file"], "/tmp/a/root.body")
+        self.assertEqual(fact_map["artifact.headers_file"], "/tmp/a/root.headers")
+        self.assertEqual(fact_map["artifact.cookies_file"], "/tmp/a/root.cookies.txt")
+
+    def test_preflight_autofixes_html_file_extension(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            artifact_dir = Path(td) / "artifacts"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            html_path = artifact_dir / "root.body.html"
+            html_path.write_text("<html><body>ok</body></html>", encoding="utf-8")
+            repo_root = Path(__file__).resolve().parents[1]
+            script_path = repo_root / "scripts" / "extract_html_attack_surface.py"
+
+            memory = MemoryStore(Path(td) / "mem.sqlite", run_id="a6")
+            memory.upsert_fact("artifact.dir", str(artifact_dir), 0.95, 0)
+
+            command = (
+                f"python3 {script_path} "
+                f"--html-file {artifact_dir / 'root.body'} --base-url http://target.local "
+                f"--out {artifact_dir / 'html_attack_surface.json'}"
+            )
+            result = preflight_command_quality(
+                command=command,
+                action_name="extract_html_attack_surface",
+                memory=memory,
+                env={},
+                cwd=artifact_dir,
+            )
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["autofixed"])
+            self.assertIn("root.body.html", result["command"])
+
+    def test_extract_facts_parses_sqli_source_leak_hints(self) -> None:
+        stdout = (
+            "SELECT rowid FROM users WHERE uname = 'demo' AND pass = 'hash';\n"
+            "username = username.replace('admin', '');\n"
+            "var username = trim_whitespace(req.body.username);\n"
+            "var password = trim_whitespace(req.body.password);\n"
+        )
+        facts = extract_facts("curl -sS http://target/login", stdout, "")
+        fact_map = {key: value for key, value, _ in facts}
+        self.assertEqual(fact_map["vuln.signal.sqli"], "true")
+        self.assertEqual(fact_map["debug.auth_query.sql_username_password"], "true")
+        self.assertEqual(fact_map["dbms"], "sqlite")
+        self.assertEqual(fact_map["injection.parameter"], "username")
+        self.assertEqual(fact_map["filter.username_strip_admin"], "true")
+        self.assertEqual(fact_map["filter.username_whitespace_trim"], "true")
+        self.assertEqual(fact_map["filter.password_whitespace_trim"], "true")
+
+    def test_preflight_blocks_python_heredoc_inside_bash(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            memory = MemoryStore(Path(td) / "mem.sqlite", run_id="a7")
+            result = preflight_command_quality(
+                command="bash -lc 'python3 - <<'\"'\"'PY'\"'\"'\nprint(1)\nPY'",
+                action_name="",
+                memory=memory,
+                env={},
+                cwd=Path(td),
+            )
+            self.assertFalse(result["ok"])
+            self.assertIn("fragile python heredoc nested inside bash -lc", result["issues"][0])
 
 
 if __name__ == "__main__":
