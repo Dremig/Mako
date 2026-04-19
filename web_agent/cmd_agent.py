@@ -43,9 +43,11 @@ from web_agent.solver_shared import (
     hint_summary,
     info_gain_score,
     normalize_command,
+    pathological_repeat_summary,
     preflight_command_quality,
     repair_helper_command,
     recent_observations,
+    repeat_guard_summary_text,
     reflection_summary,
     reflect_step,
     merge_controller_with_gain_policy,
@@ -79,6 +81,48 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
+def empty_response_contexts() -> dict[str, dict[str, Any]]:
+    return {
+        "planner": {},
+        "counter_solver": {},
+        "tactical_solver": {},
+        "recommender": {},
+        "corrector": {},
+        "summary": {},
+    }
+
+
+def normalize_response_contexts(raw: Any) -> dict[str, dict[str, Any]]:
+    base = empty_response_contexts()
+    if not isinstance(raw, dict):
+        return base
+    for role in list(base.keys()):
+        ctx = raw.get(role, {})
+        base[role] = dict(ctx) if isinstance(ctx, dict) else {}
+    return base
+
+
+def load_response_contexts_from_run_state(
+    path: Path,
+    *,
+    target: str,
+    base_url: str,
+    model: str,
+) -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return empty_response_contexts()
+    if not isinstance(data, dict):
+        return empty_response_contexts()
+    prior_target = str(data.get("target", "")).strip()
+    prior_base_url = str(data.get("base_url", "")).strip()
+    prior_model = str(data.get("model", "")).strip()
+    if prior_target != target or prior_base_url != base_url or prior_model != model:
+        return empty_response_contexts()
+    return normalize_response_contexts(data.get("response_contexts", {}))
+
+
 def summarize_run(
     base_url: str,
     api_key: str,
@@ -87,6 +131,7 @@ def summarize_run(
     objective: str,
     history: list[dict[str, Any]],
     found_flag: str,
+    response_context: dict[str, Any] | None = None,
 ) -> str:
     prompt = (
         "Summarize this command-driven CTF run.\n"
@@ -104,6 +149,7 @@ def summarize_run(
         model=model,
         messages=[{"role": "system", "content": prompt}, {"role": "user", "content": content}],
         temperature=0.1,
+        response_context=response_context,
     )
 
 
@@ -213,6 +259,15 @@ class QueueWorkerOrchestrator:
 
 
 def main() -> None:
+    counter_session_reset_default = 8
+    counter_session_reset_raw = os.getenv("OPENAI_COUNTER_SESSION_RESET_STEPS", "").strip()
+    if counter_session_reset_raw:
+        try:
+            counter_session_reset_default = int(counter_session_reset_raw)
+        except ValueError:
+            counter_session_reset_default = 8
+    counter_session_reset_default = max(0, min(counter_session_reset_default, 100))
+
     parser = argparse.ArgumentParser(description="Codex-style command agent for blackbox CTF web challenges")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--env", type=Path, default=Path(".env"))
@@ -229,7 +284,25 @@ def main() -> None:
     parser.add_argument("--run-id", type=str, default="")
     parser.add_argument("--out", type=Path, default=Path("logs/cmd_agent_last_run.json"))
     parser.add_argument("--artifact-dir", type=Path, default=Path("artifacts/cmd_agent"))
+    parser.add_argument(
+        "--resume-response-context",
+        action="store_true",
+        default=True,
+        help="Resume previous_response_id chains from logs/cmd_agent_last_run.json when metadata matches.",
+    )
+    parser.add_argument(
+        "--no-resume-response-context",
+        action="store_false",
+        dest="resume_response_context",
+        help="Start with fresh Responses contexts instead of resuming the last matching run.",
+    )
     parser.add_argument("--worker-mode", type=str, default="threaded", choices=["threaded", "sync"])
+    parser.add_argument(
+        "--counter-session-reset-steps",
+        type=int,
+        default=counter_session_reset_default,
+        help="Reset counter-solver Responses session after N successful turns (0 to disable).",
+    )
     parser.add_argument(
         "--solver-mode",
         type=str,
@@ -237,6 +310,7 @@ def main() -> None:
         choices=["codex", "codex_pure", "codex_collab", "legacy"],
     )
     args = parser.parse_args()
+    counter_session_reset_steps = max(0, min(int(args.counter_session_reset_steps), 100))
 
     root = args.root.resolve()
     load_dotenv((root / args.env).resolve())
@@ -262,11 +336,13 @@ def main() -> None:
     if not args.out.is_absolute() and str(args.out).startswith("logs/"):
         out_path = (artifact_dir / args.out.name).resolve()
     heartbeat_path = (artifact_dir / "cmd_agent_heartbeat.json").resolve()
+    latest_run_state_path = (root / "logs" / "cmd_agent_last_run.json").resolve()
 
     memory = MemoryStore(memory_db_path, run_id=run_id)
     memory.upsert_fact("target", target, 1.0, 0)
     memory.upsert_fact("objective", args.objective, 1.0, 0)
     memory.upsert_fact("hint", args.hint, 0.9, 0)
+    memory.upsert_fact("counter.session_reset_steps", str(counter_session_reset_steps), 0.9, 0)
     memory.upsert_fact("artifact.dir", str(artifact_dir), 0.95, 0)
     memory.upsert_fact("project.root", str(root), 0.95, 0)
     memory.ensure_flow(target=target, objective=args.objective, hint=args.hint, status="running")
@@ -290,6 +366,20 @@ def main() -> None:
     current_step = 0
     current_stage = "init"
     current_plan = fallback_plan(memory)
+    response_contexts: dict[str, dict[str, Any]] = empty_response_contexts()
+    if args.resume_response_context:
+        loaded_contexts = load_response_contexts_from_run_state(
+            latest_run_state_path,
+            target=target,
+            base_url=base_url,
+            model=chat_model,
+        )
+        if any(bool(ctx.get("previous_response_id", "") or ctx.get("disable_previous_response_id", False)) for ctx in loaded_contexts.values()):
+            response_contexts = loaded_contexts
+            print(f"[cmd-agent] resumed response contexts from {latest_run_state_path}")
+            memory.add_event(0, "response_context_resume", str(latest_run_state_path))
+    response_context_seen: dict[str, str] = {}
+    response_context_turns: dict[str, int] = {key: 0 for key in response_contexts.keys()}
     persist_plan(memory, current_plan, step=0)
     orchestrator = QueueWorkerOrchestrator(max_workers=2) if args.worker_mode == "threaded" else None
 
@@ -313,6 +403,50 @@ def main() -> None:
         append_jsonl(dialogue_log_path, body)
         memory.add_event(step, f"dialogue.{kind}", json.dumps(payload, ensure_ascii=False)[:3000])
 
+    def note_response_context(step: int, role: str) -> None:
+        ctx = response_contexts.get(role, {})
+        rid = str(ctx.get("previous_response_id", "")).strip()
+        if not rid:
+            return
+        if response_context_seen.get(role) == rid:
+            return
+        response_context_turns[role] = int(response_context_turns.get(role, 0)) + 1
+        response_context_seen[role] = rid
+        memory.add_event(step, f"response_context.{role}", rid[:200])
+        log_dialogue(
+            step,
+            "response_context",
+            {
+                "role": role,
+                "previous_response_id": rid,
+                "turn": response_context_turns.get(role, 0),
+            },
+        )
+
+    def maybe_reset_response_context(step: int, role: str, reason: str) -> None:
+        if role != "counter_solver":
+            return
+        if counter_session_reset_steps <= 0:
+            return
+        turns = int(response_context_turns.get(role, 0))
+        if turns < counter_session_reset_steps:
+            return
+        ctx = response_contexts.get(role, {})
+        prev_id = str(ctx.get("previous_response_id", "")).strip()
+        if not prev_id:
+            return
+        response_contexts[role] = {}
+        response_context_seen.pop(role, None)
+        response_context_turns[role] = 0
+        reset_payload = {
+            "role": role,
+            "reason": reason,
+            "reset_after_turns": turns,
+            "reset_every": counter_session_reset_steps,
+        }
+        memory.add_event(step, f"response_context_reset.{role}", json.dumps(reset_payload, ensure_ascii=False))
+        log_dialogue(step, "response_context_reset", reset_payload)
+
     def build_run_obj(*, include_memory: bool = True, partial: bool = True) -> dict[str, Any]:
         return {
             "timestamp": utc_now_z(),
@@ -320,6 +454,7 @@ def main() -> None:
             "target": target,
             "objective": args.objective,
             "hint": args.hint,
+            "base_url": base_url,
             "model": chat_model,
             "memory_db": str(memory_db_path),
             "artifact_dir": str(artifact_dir),
@@ -338,6 +473,7 @@ def main() -> None:
             "current_step": current_step,
             "current_stage": current_stage,
             "current_plan": current_plan,
+            "response_contexts": response_contexts,
         }
 
     def flush_run_state(stage: str, *, final: bool = False) -> None:
@@ -346,6 +482,7 @@ def main() -> None:
         payload = build_run_obj(include_memory=True, partial=not final)
         atomic_write_json(heartbeat_path, payload)
         atomic_write_json(out_path, payload)
+        atomic_write_json(latest_run_state_path, payload)
 
     def handle_termination(signum: int, _frame: Any) -> None:
         nonlocal final_report
@@ -548,6 +685,16 @@ def main() -> None:
             hypo_summary = hypothesis_summary(memory, max_items=12)
             actions_text = available_actions_summary()
             expected_phase, constraints = derive_phase_state(memory, history)
+            repeat_guard = pathological_repeat_summary(history, memory)
+            repeat_guard_text = repeat_guard_summary_text(repeat_guard)
+            memory.upsert_fact("repeat_guard.active", "true" if repeat_guard.get("active") else "false", 0.96, step)
+            memory.upsert_fact("repeat_guard.reason", str(repeat_guard.get("reason", ""))[:120], 0.93, step)
+            memory.upsert_fact("repeat_guard.family", str(repeat_guard.get("repeated_family", ""))[:120], 0.92, step)
+            memory.upsert_fact("repeat_guard.surface", str(repeat_guard.get("repeated_surface", ""))[:180], 0.92, step)
+            if repeat_guard.get("active"):
+                for item in repeat_guard.get("requirements", [])[:3]:
+                    constraints.append(f"Repeat guard: {item}")
+                memory.add_event(step, "repeat_guard", json.dumps(repeat_guard, ensure_ascii=False)[:3000])
             # Rebind expected phase based on latest local derivation and reflector override.
             phase_override = str(controller_reflection.get("phase_override", "")).strip().lower()
             if phase_override in {"recon", "probe", "exploit", "extract", "verify"}:
@@ -603,7 +750,9 @@ def main() -> None:
                     history_text=short_history(history),
                     recent_obs=recent_observations(history),
                     memory=memory,
+                    response_context=response_contexts["planner"],
                 )
+                note_response_context(step, "planner")
                 persist_plan(memory, current_plan, step)
                 memory.add_event(step, "plan_refresh", json.dumps(current_plan, ensure_ascii=False)[:3000])
                 flush_run_state("post_plan")
@@ -630,7 +779,8 @@ def main() -> None:
                     f"Plan rationale: {str(current_plan.get('rationale', '')).strip()}\n"
                     f"Current plan summary:\n{plan_summary(current_plan)}\n\n"
                     f"Endpoint candidates:\n{endpoints_text}\n\n"
-                    f"Comment hints:\n{hints_text}\n"
+                    f"Comment hints:\n{hints_text}\n\n"
+                    f"{repeat_guard_text}\n"
                 )
                 interpreter_notes_text = (
                     f"Task priors:\n{prior_summary}\n\n"
@@ -639,14 +789,22 @@ def main() -> None:
                 reflector_notes_text = (
                     f"Controller rationale: {str(controller_reflection.get('rationale', '')).strip() or 'none'}\n"
                     f"Recent reflection summary:\n{reflect_summary}\n\n"
+                    f"{repeat_guard_text}\n\n"
                     f"Soft notes from reflector:\n"
                     + ("\n".join(f"- {item}" for item in (controller_do + controller_avoid)[:6]) if (controller_do or controller_avoid) else "- none")
                 )
                 if args.solver_mode in {"codex_pure", "codex_collab"}:
-                    planner_context_text = f"{args.solver_mode} mode: planner/interpreter/reflector are advisory only. Prioritize runtime evidence."
+                    planner_context_text = (
+                        f"{args.solver_mode} mode: planner/interpreter/reflector are advisory only. Prioritize runtime evidence.\n\n"
+                        f"{repeat_guard_text}"
+                    )
                     interpreter_notes_text = f"{args.solver_mode} mode: interpreter priors disabled for this run."
-                    reflector_notes_text = f"{args.solver_mode} mode: reflector policy disabled for this run."
+                    reflector_notes_text = (
+                        f"{args.solver_mode} mode: reflector policy disabled for this run.\n\n"
+                        f"{repeat_guard_text}"
+                    )
                 if is_collab_mode:
+                    maybe_reset_response_context(step, "counter_solver", "periodic_turn_limit")
                     counter_solver_notes = run_counter_solver(
                         base_url=base_url,
                         api_key=api_key,
@@ -661,8 +819,10 @@ def main() -> None:
                         recent_history=short_history(history),
                         recent_obs=recent_observations(history),
                         retrieved_context=context,
+                        response_context=response_contexts["counter_solver"],
                         trace_hook=(lambda payload: log_dialogue(step, str(payload.get("kind", "counter")), payload)),
                     )
+                    note_response_context(step, "counter_solver")
                 plan, judge = run_tactical_solver(
                     base_url=base_url,
                     api_key=api_key,
@@ -691,8 +851,10 @@ def main() -> None:
                     retrieved_context=context,
                     counter_solver_notes=counter_solver_notes,
                     collab_mode=is_collab_mode,
+                    response_context=response_contexts["tactical_solver"],
                     trace_hook=(lambda payload: log_dialogue(step, str(payload.get("kind", "tactical")), payload)),
                 )
+                note_response_context(step, "tactical_solver")
             else:
                 planner_prompt = (
                     "You are a Codex-style CTF command agent.\n"
@@ -761,7 +923,9 @@ def main() -> None:
                     model=chat_model,
                     system_prompt=planner_prompt,
                     user_prompt=user_prompt,
+                    response_context=response_contexts["recommender"],
                 )
+                note_response_context(step, "recommender")
                 corrector_review = run_corrector(
                     base_url=base_url,
                     api_key=api_key,
@@ -777,7 +941,9 @@ def main() -> None:
                     available_actions_text=actions_text,
                     memory_summary=memory_summary,
                     recent_history=short_history(history),
+                    response_context=response_contexts["corrector"],
                 )
+                note_response_context(step, "corrector")
                 plan, judge = choose_final_proposal(
                     recommender=recommender_plan,
                     corrector=corrector_review,
@@ -865,7 +1031,20 @@ def main() -> None:
                     str(memory.get_fact("flag.candidate") or "").strip(),
                     str(memory.get_fact("flag.confirmed") or "").strip(),
                 ]
-                has_solved_evidence = any(marker for marker in solved_markers)
+                has_flag_like_evidence = any(FLAG_RE.search(marker) for marker in solved_markers if marker)
+                has_goal_flag = str(memory.get_fact("hypothesis.state.goal:flag") or "").strip().lower() == "confirmed"
+                has_remaining_work = any(
+                    isinstance(item, dict)
+                    and str(item.get("status", "pending")).strip().lower() == "pending"
+                    and str(item.get("phase", "")).strip().lower() in {"probe", "exploit", "extract", "verify"}
+                    for item in current_plan.get("subtasks", [])
+                )
+                has_solved_evidence = has_flag_like_evidence or has_goal_flag
+                unsafe_done_reason = ""
+                if not has_solved_evidence:
+                    unsafe_done_reason = "no_flag_evidence"
+                elif has_remaining_work and not has_flag_like_evidence:
+                    unsafe_done_reason = "pending_subtasks_without_flag"
                 if has_solved_evidence:
                     done = True
                     final_report = "Model decided challenge solved."
@@ -878,8 +1057,10 @@ def main() -> None:
                     )
                     flush_run_state("model_done")
                     break
-                memory.add_event(step, "unsafe_done_rewrite", "rewrote model done decision without solved evidence")
+                memory.add_event(step, "unsafe_done_rewrite", f"rewrote model done decision: {unsafe_done_reason or 'unsafe_done'}")
                 memory.upsert_fact("error.tactical.unsafe_done", "true", 0.96, step)
+                if unsafe_done_reason:
+                    memory.upsert_fact("error.tactical.unsafe_done.reason", unsafe_done_reason, 0.96, step)
                 if active_action:
                     decision = "action"
                     action_obj = {"name": active_action, "args": {}}
@@ -934,7 +1115,7 @@ def main() -> None:
                 memory.upsert_fact("error.preflight.last", reason[:220], 0.96, step)
                 if is_collab_mode:
                     fallback_cmd = str(plan.get("next_if_fail", "")).replace("{target}", target).strip() or "curl -si $TARGET_URL/"
-                    cmd = validate_command(repair_helper_command(fallback_cmd))
+                    cmd = validate_command(repair_helper_command(fallback_cmd, memory))
                     memory.add_event(step, "preflight_soft_bypass", f"{reason[:200]} | fallback={cmd[:140]}")
                     log_dialogue(step, "preflight_soft_bypass", {"reason": reason, "fallback_cmd": cmd})
                 else:
@@ -1188,7 +1369,9 @@ def main() -> None:
             objective=args.objective,
             history=history,
             found_flag=found_flag,
+            response_context=response_contexts["summary"],
         )
+        note_response_context(max(1, len(history)), "summary")
 
     run_success = bool(found_flag)
     memory.set_task_state_status(
