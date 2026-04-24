@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from rag.common import embed_texts, load_dotenv, require_env
+from rag.common import embed_texts, load_dotenv, require_openai_auth_token
 
 
 def parse_args() -> argparse.Namespace:
@@ -119,8 +119,8 @@ def main() -> None:
     load_dotenv((root / args.env).resolve())
     config = read_json((root / args.config).resolve())
 
-    api_key = require_env("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+    api_key = require_openai_auth_token(root=root)
+    base_url = os.getenv("OPENAI_BASE_URL", "https://yunwu.ai/v1").strip()
     embed_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
 
     out_path = (root / args.out).resolve()

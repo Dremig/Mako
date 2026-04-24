@@ -9,7 +9,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from rag.common import chat_completion, cosine_similarity, embed_texts, load_dotenv, require_env
+from rag.common import chat_completion, cosine_similarity, embed_texts, load_dotenv, require_openai_auth_token
 
 
 def parse_args() -> argparse.Namespace:
@@ -112,14 +112,17 @@ def retrieve(
     bm25_k1: float,
     bm25_b: float,
 ) -> list[dict[str, Any]]:
+    effective_mode = mode
     if mode in {"dense", "hybrid"}:
         if question_embedding is None:
-            raise RuntimeError("question_embedding is required for dense/hybrid mode")
-        dense_raw = dense_scores(question_embedding, docs)
+            effective_mode = "bm25"
+            dense_raw = [0.0 for _ in docs]
+        else:
+            dense_raw = dense_scores(question_embedding, docs)
     else:
         dense_raw = [0.0 for _ in docs]
 
-    if mode in {"bm25", "hybrid"}:
+    if effective_mode in {"bm25", "hybrid"}:
         bm25_raw = bm25_scores(question, docs, k1=bm25_k1, b=bm25_b)
     else:
         bm25_raw = [0.0 for _ in docs]
@@ -130,9 +133,9 @@ def retrieve(
 
     scored: list[dict[str, Any]] = []
     for i, doc in enumerate(docs):
-        if mode == "dense":
+        if effective_mode == "dense":
             final_score = dense_raw[i]
-        elif mode == "bm25":
+        elif effective_mode == "bm25":
             final_score = bm25_raw[i]
         else:
             final_score = alpha * dense_norm[i] + (1.0 - alpha) * bm25_norm[i]
@@ -176,8 +179,8 @@ def main() -> None:
     root = args.root.resolve()
     load_dotenv((root / args.env).resolve())
 
-    api_key = require_env("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+    api_key = require_openai_auth_token(root=root)
+    base_url = os.getenv("OPENAI_BASE_URL", "https://yunwu.ai/v1").strip()
     embed_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
     chat_model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini").strip()
 
@@ -191,7 +194,11 @@ def main() -> None:
 
     q_embedding: list[float] | None = None
     if args.mode in {"dense", "hybrid"}:
-        q_embedding = embed_texts(base_url=base_url, api_key=api_key, model=embed_model, texts=[args.question])[0]
+        try:
+            q_embedding = embed_texts(base_url=base_url, api_key=api_key, model=embed_model, texts=[args.question])[0]
+        except Exception as exc:
+            print(f"[warn] dense retrieval degraded to bm25: {exc}")
+            q_embedding = None
 
     hits = retrieve(
         question=args.question,

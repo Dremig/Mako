@@ -17,7 +17,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from rag.common import chat_completion, cosine_similarity, embed_texts, load_dotenv, require_env
+from rag.common import chat_completion, cosine_similarity, embed_texts, load_dotenv, require_openai_auth_token
 
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_./:%?=&+-]+|[\u4e00-\u9fff]")
@@ -110,13 +110,18 @@ def hybrid_retrieve(
         return []
 
     alpha = max(0.0, min(1.0, alpha))
+    effective_mode = mode
     dense_raw = [0.0 for _ in docs]
     if mode in {"dense", "hybrid"}:
-        q_vec = embed_texts(base_url=base_url, api_key=api_key, model=embed_model, texts=[query])[0]
-        dense_raw = [cosine_similarity(q_vec, d["embedding"]) for d in docs]
+        try:
+            q_vec = embed_texts(base_url=base_url, api_key=api_key, model=embed_model, texts=[query])[0]
+            dense_raw = [cosine_similarity(q_vec, d["embedding"]) for d in docs]
+        except Exception as exc:
+            print(f"[warn] dense retrieval degraded to bm25: {exc}")
+            effective_mode = "bm25"
 
     bm25_raw = [0.0 for _ in docs]
-    if mode in {"bm25", "hybrid"}:
+    if effective_mode in {"bm25", "hybrid"}:
         bm25_raw = bm25_scores(query, docs)
 
     dense_norm = normalize_minmax(dense_raw)
@@ -124,9 +129,9 @@ def hybrid_retrieve(
 
     scored: list[dict[str, Any]] = []
     for i, d in enumerate(docs):
-        if mode == "dense":
+        if effective_mode == "dense":
             final_score = dense_raw[i]
-        elif mode == "bm25":
+        elif effective_mode == "bm25":
             final_score = bm25_raw[i]
         else:
             final_score = alpha * dense_norm[i] + (1.0 - alpha) * bm25_norm[i]
@@ -645,8 +650,8 @@ def main() -> None:
     root = args.root.resolve()
     load_dotenv((root / args.env).resolve())
 
-    api_key = require_env("OPENAI_API_KEY")
-    base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip()
+    api_key = require_openai_auth_token(root=root)
+    base_url = os.getenv("OPENAI_BASE_URL", "https://yunwu.ai/v1").strip()
     chat_model = os.getenv("OPENAI_AGENT_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-5.2")).strip()
     embed_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
 

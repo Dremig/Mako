@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import re
 import ssl
 import time
 import ipaddress
@@ -35,6 +36,54 @@ def require_env(name: str) -> str:
     if not value:
         raise RuntimeError(f"Missing required env var: {name}")
     return value
+
+
+def _read_access_token_from_auth_json(path: Path) -> str:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        return ""
+    token = str(tokens.get("access_token", "")).strip()
+    return token
+
+
+def require_openai_auth_token(root: Path | None = None) -> str:
+    token = os.getenv("OPENAI_ACCESS_TOKEN", "").strip()
+    if token:
+        return token
+
+    auth_json_candidates: list[Path] = []
+    auth_json_env = os.getenv("OPENAI_AUTH_JSON", "").strip()
+    if auth_json_env:
+        auth_json_candidates.append(Path(auth_json_env).expanduser())
+    if root is not None:
+        auth_json_candidates.append((root / "auth.json").resolve())
+    auth_json_candidates.append(Path("auth.json").resolve())
+
+    seen: set[Path] = set()
+    for candidate in auth_json_candidates:
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if not candidate.exists() or not candidate.is_file():
+            continue
+        token = _read_access_token_from_auth_json(candidate)
+        if token:
+            return token
+
+    if os.getenv("OPENAI_API_KEY", "").strip():
+        raise RuntimeError(
+            "OPENAI_API_KEY is disabled by policy. "
+            "Use OPENAI_ACCESS_TOKEN or provide auth.json with tokens.access_token."
+        )
+    raise RuntimeError(
+        "Missing auth token. Set OPENAI_ACCESS_TOKEN or provide auth.json with tokens.access_token."
+    )
 
 
 def _env_truthy(name: str) -> bool:
@@ -82,6 +131,138 @@ def _responses_reasoning() -> dict[str, Any] | None:
 
 def _responses_force_stream() -> bool:
     return _env_truthy("OPENAI_RESPONSES_FORCE_STREAM")
+
+
+def _responses_disable_previous_response_id() -> bool:
+    return _env_truthy("OPENAI_RESPONSES_DISABLE_PREVIOUS_RESPONSE_ID")
+
+
+def _responses_use_local_msgchain() -> bool:
+    return _env_truthy("OPENAI_LOCAL_MSGCHAIN")
+
+
+def _responses_replay_max_messages() -> int:
+    raw = os.getenv("OPENAI_REPLAY_MAX_MESSAGES", "80").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 80
+    return max(8, min(value, 400))
+
+
+def _responses_long_memory_enabled() -> bool:
+    raw = os.getenv("OPENAI_LONG_TERM_MEMORY", "true").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _responses_long_memory_max_items() -> int:
+    raw = os.getenv("OPENAI_LONG_TERM_MAX_ITEMS", "64").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 64
+    return max(8, min(value, 256))
+
+
+def _responses_long_memory_recall_topk() -> int:
+    raw = os.getenv("OPENAI_LONG_TERM_RECALL_TOPK", "3").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 3
+    return max(1, min(value, 12))
+
+
+def _memory_tokenize(text: str) -> list[str]:
+    return [t for t in re.split(r"[^a-z0-9_./:-]+", text.lower()) if len(t) >= 3]
+
+
+def _memory_keywords(text: str, limit: int = 16) -> list[str]:
+    stop = {
+        "the", "and", "that", "with", "this", "from", "have", "were", "what", "when", "where", "your",
+        "http", "https", "json", "role", "content", "user", "assistant", "system", "reply", "only",
+    }
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in _memory_tokenize(text):
+        if tok in stop or tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _normalize_long_term_memory(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        summary = str(item.get("summary", "")).strip()
+        keywords = item.get("keywords", [])
+        if not summary:
+            continue
+        if not isinstance(keywords, list):
+            keywords = []
+        kws = [str(k).strip().lower() for k in keywords if str(k).strip()]
+        out.append({"summary": summary, "keywords": kws})
+    return out
+
+
+def _summarize_for_long_term(messages: list[dict[str, str]]) -> str:
+    lines: list[str] = []
+    for item in messages[-8:]:
+        role = str(item.get("role", "")).strip() or "msg"
+        content = str(item.get("content", "")).strip().replace("\n", " ")
+        if not content:
+            continue
+        lines.append(f"{role}: {content[:160]}")
+    return " | ".join(lines)[:1000]
+
+
+def _append_long_term_memory(context: dict[str, Any], messages: list[dict[str, str]]) -> None:
+    if not messages or not _responses_long_memory_enabled():
+        return
+    summary = _summarize_for_long_term(messages)
+    if not summary:
+        return
+    memory = _normalize_long_term_memory(context.get("long_term_memory", []))
+    entry = {
+        "summary": summary,
+        "keywords": _memory_keywords(summary),
+    }
+    memory.append(entry)
+    context["long_term_memory"] = memory[-_responses_long_memory_max_items():]
+
+
+def _recall_long_term_message(context: dict[str, Any], messages: list[dict[str, str]]) -> dict[str, str] | None:
+    if not _responses_long_memory_enabled():
+        return None
+    memory = _normalize_long_term_memory(context.get("long_term_memory", []))
+    if not memory:
+        return None
+    query = " ".join(str(item.get("content", "")) for item in messages[-3:])
+    qset = set(_memory_keywords(query, limit=24))
+    if not qset:
+        return None
+    scored: list[tuple[int, dict[str, Any]]] = []
+    for item in memory:
+        kws = {str(k).strip().lower() for k in item.get("keywords", []) if str(k).strip()}
+        score = len(qset & kws)
+        if score > 0:
+            scored.append((score, item))
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    topk = scored[:_responses_long_memory_recall_topk()]
+    lines = [f"- {item['summary']}" for _, item in topk]
+    return {
+        "role": "system",
+        "content": "Long-term memory recall:\n" + "\n".join(lines),
+    }
 
 
 def _ssl_context_for(base_url: str, allow_insecure_fallback: bool = False) -> ssl.SSLContext | None:
@@ -222,12 +403,13 @@ def _messages_to_responses_input(messages: list[dict[str, str]]) -> list[dict[st
     for item in messages:
         role = str(item.get("role", "user")).strip() or "user"
         content = str(item.get("content", ""))
+        content_type = "output_text" if role == "assistant" else "input_text"
         out.append(
             {
                 "role": role,
                 "content": [
                     {
-                        "type": "input_text",
+                        "type": content_type,
                         "text": content,
                     }
                 ],
@@ -262,8 +444,28 @@ def _response_output_text(data: dict[str, Any]) -> str:
     return "\n".join(part for part in texts if part).strip()
 
 
-def _stream_response_events_to_text(raw: str) -> str:
+def _extract_response_id_from_payload(payload: dict[str, Any], event_type: str = "") -> str:
+    response_obj = payload.get("response")
+    if isinstance(response_obj, dict):
+        rid = response_obj.get("id")
+        if isinstance(rid, str) and rid.strip():
+            return rid.strip()
+    direct = payload.get("response_id")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    if event_type in {"response.created", "response.in_progress", "response.completed"}:
+        rid = payload.get("id")
+        if isinstance(rid, str) and rid.strip():
+            return rid.strip()
+    rid = payload.get("id")
+    if isinstance(rid, str) and rid.strip() and not event_type:
+        return rid.strip()
+    return ""
+
+
+def _stream_response_events(raw: str) -> tuple[str, str]:
     parts: list[str] = []
+    response_id = ""
     for line in raw.splitlines():
         line = line.strip()
         if not line.startswith("data:"):
@@ -276,6 +478,8 @@ def _stream_response_events_to_text(raw: str) -> str:
         except Exception:
             continue
         event_type = str(item.get("type", "")).strip()
+        if not response_id and isinstance(item, dict):
+            response_id = _extract_response_id_from_payload(item, event_type=event_type)
         if event_type == "response.output_text.delta":
             delta = item.get("delta")
             if isinstance(delta, str) and delta:
@@ -285,7 +489,54 @@ def _stream_response_events_to_text(raw: str) -> str:
             text = item.get("text")
             if isinstance(text, str) and text and not parts:
                 parts.append(text)
-    return "".join(parts).strip()
+    return "".join(parts).strip(), response_id
+
+
+def _normalize_replay_messages(raw: Any) -> list[dict[str, str]]:
+    if not isinstance(raw, list):
+        return []
+    out: list[dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("role", "")).strip()
+        content = str(item.get("content", ""))
+        if role and content:
+            out.append({"role": role, "content": content})
+    return out
+
+
+def _merge_replay_messages(
+    *,
+    context: dict[str, Any],
+    messages: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    recalled = _recall_long_term_message(context, messages)
+    replay = _normalize_replay_messages(context.get("replay_messages", []))
+    merged: list[dict[str, str]] = []
+    if recalled is not None:
+        merged.append(recalled)
+    if replay:
+        merged.extend(replay)
+    merged.extend(messages)
+    return merged
+
+
+def _update_replay_messages(
+    *,
+    context: dict[str, Any],
+    messages: list[dict[str, str]],
+    assistant_text: str,
+) -> None:
+    replay = _normalize_replay_messages(context.get("replay_messages", []))
+    replay.extend({"role": str(item.get("role", "")).strip(), "content": str(item.get("content", ""))} for item in messages)
+    if assistant_text.strip():
+        replay.append({"role": "assistant", "content": assistant_text})
+    # Keep a bounded replay window so gateway fallback cannot grow without limit.
+    max_keep = _responses_replay_max_messages()
+    if len(replay) > max_keep:
+        _append_long_term_memory(context, replay[:-max_keep])
+    context["replay_messages"] = replay[-max_keep:]
 
 
 def responses_create(
@@ -302,7 +553,7 @@ def _responses_text_stream(
     api_key: str,
     payload: dict[str, Any],
     timeout: int = 120,
-) -> str:
+) -> tuple[str, str]:
     request_payload = dict(payload)
     request_payload["stream"] = True
     url = base_url.rstrip("/") + "/responses"
@@ -318,12 +569,95 @@ def _responses_text_stream(
     )
     context = _ssl_context_for(base_url)
     opener = _build_opener(base_url, context)
-    with opener.open(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="ignore")
-    text = _stream_response_events_to_text(raw)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="ignore")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="ignore")
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {detail[:1000]}") from exc
+    except Exception as exc:
+        raise RuntimeError(f"Network error for {url}: {exc}") from exc
+    text, response_id = _stream_response_events(raw)
     if text:
-        return text
+        return text, response_id
     raise RuntimeError("Streaming Responses API returned no text output")
+
+
+def responses_text_with_meta(
+    base_url: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, str]],
+    temperature: float = 0.2,
+    text_format: dict[str, Any] | None = None,
+    response_context: dict[str, Any] | None = None,
+) -> tuple[str, dict[str, Any]]:
+    def _call_once(request_payload: dict[str, Any]) -> tuple[str, str]:
+        if _responses_force_stream():
+            return _responses_text_stream(base_url, api_key, request_payload)
+        try:
+            data = responses_create(base_url, api_key, request_payload)
+            text = _response_output_text(data)
+            if text:
+                rid = _extract_response_id_from_payload(data)
+                return text, rid
+            raise RuntimeError("Responses API returned no text output")
+        except RuntimeError as exc:
+            if "Stream must be set to true" not in str(exc):
+                raise
+            return _responses_text_stream(base_url, api_key, request_payload)
+
+    context_out = response_context if isinstance(response_context, dict) else {}
+    disable_prev = _responses_disable_previous_response_id()
+    use_local_msgchain = _responses_use_local_msgchain()
+    request_messages = messages
+    if isinstance(response_context, dict):
+        disable_prev = bool(response_context.get("disable_previous_response_id", False)) or disable_prev
+        use_local_msgchain = bool(response_context.get("use_local_msgchain", False)) or use_local_msgchain
+        if use_local_msgchain:
+            disable_prev = True
+        if disable_prev or use_local_msgchain:
+            request_messages = _merge_replay_messages(context=response_context, messages=messages)
+    if isinstance(context_out, dict):
+        context_out["use_local_msgchain"] = bool(use_local_msgchain)
+
+    payload: dict[str, Any] = {
+        "model": model,
+        "input": _messages_to_responses_input(request_messages),
+        "temperature": temperature,
+    }
+    previous_response_id = ""
+    if isinstance(response_context, dict):
+        previous_response_id = str(response_context.get("previous_response_id", "")).strip()
+        if previous_response_id and not disable_prev and not _responses_disable_previous_response_id():
+            payload["previous_response_id"] = previous_response_id
+    reasoning = _responses_reasoning()
+    if reasoning is not None:
+        payload["reasoning"] = reasoning
+    if text_format is not None:
+        payload["text"] = {"format": text_format}
+
+    used_prev = "previous_response_id" in payload
+    try:
+        text, response_id = _call_once(payload)
+        if response_id:
+            context_out["previous_response_id"] = response_id
+        if disable_prev or use_local_msgchain:
+            _update_replay_messages(context=context_out, messages=messages, assistant_text=text)
+        return text, context_out
+    except RuntimeError:
+        if not used_prev:
+            raise
+        # Some OpenAI-compatible gateways reject previous_response_id while supporting
+        # /responses. Retry once without chained response id and disable it for this context.
+        payload.pop("previous_response_id", None)
+        payload["input"] = _messages_to_responses_input(_merge_replay_messages(context=context_out, messages=messages))
+        text, response_id = _call_once(payload)
+        context_out["disable_previous_response_id"] = True
+        if response_id:
+            context_out["previous_response_id"] = response_id
+        _update_replay_messages(context=context_out, messages=messages, assistant_text=text)
+        return text, context_out
 
 
 def responses_text(
@@ -333,29 +667,18 @@ def responses_text(
     messages: list[dict[str, str]],
     temperature: float = 0.2,
     text_format: dict[str, Any] | None = None,
+    response_context: dict[str, Any] | None = None,
 ) -> str:
-    payload: dict[str, Any] = {
-        "model": model,
-        "input": _messages_to_responses_input(messages),
-        "temperature": temperature,
-    }
-    reasoning = _responses_reasoning()
-    if reasoning is not None:
-        payload["reasoning"] = reasoning
-    if text_format is not None:
-        payload["text"] = {"format": text_format}
-    if _responses_force_stream():
-        return _responses_text_stream(base_url, api_key, payload)
-    try:
-        data = responses_create(base_url, api_key, payload)
-        text = _response_output_text(data)
-        if text:
-            return text
-        raise RuntimeError("Responses API returned no text output")
-    except RuntimeError as exc:
-        if "Stream must be set to true" not in str(exc):
-            raise
-        return _responses_text_stream(base_url, api_key, payload)
+    text, _ = responses_text_with_meta(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        text_format=text_format,
+        response_context=response_context,
+    )
+    return text
 
 
 def _stream_chunks_to_text(raw: str) -> str:
@@ -470,15 +793,18 @@ def chat_completion(
     model: str,
     messages: list[dict[str, str]],
     temperature: float = 0.2,
+    response_context: dict[str, Any] | None = None,
 ) -> str:
     if _api_mode(base_url) == "responses":
-        return responses_text(
+        text, _ = responses_text_with_meta(
             base_url=base_url,
             api_key=api_key,
             model=model,
             messages=messages,
             temperature=temperature,
+            response_context=response_context,
         )
+        return text
     payload = {
         "model": model,
         "messages": messages,
@@ -509,6 +835,7 @@ def json_completion(
     json_schema_name: str,
     json_schema: dict[str, Any],
     temperature: float = 0.1,
+    response_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if _api_mode(base_url) == "responses":
         text = responses_text(
@@ -526,6 +853,7 @@ def json_completion(
                 "schema": json_schema,
                 "strict": True,
             },
+            response_context=response_context,
         )
         parsed = json.loads(text)
         if not isinstance(parsed, dict):
@@ -550,6 +878,7 @@ def json_completion(
             model=model,
             messages=[{"role": "system", "content": strict_system}, {"role": "user", "content": local_user_prompt}],
             temperature=temperature,
+            response_context=response_context,
         )
         try:
             parsed = extract_json(raw)
