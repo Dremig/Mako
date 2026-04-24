@@ -286,6 +286,37 @@ When enabled:
 
 This is useful for internal OpenAI-compatible endpoints that implement `/v1/responses` but reject non-streaming calls.
 
+## Stateful Responses Continuation (Implemented)
+
+To preserve Codex runtime context across steps, the agent now carries `previous_response_id` per role:
+
+- planner
+- counter solver
+- tactical solver
+- recommender
+- corrector
+- final run summarizer
+
+Implementation notes:
+
+- `rag/common.py` now supports `response_context` and updates it with the latest response id.
+- stream and non-stream Responses paths both attempt to extract and persist response ids.
+- `web_agent/cmd_agent.py` keeps per-role context dictionaries and logs updates into:
+  - memory events `response_context.<role>`
+  - `codex_dialogue.jsonl` as `kind=response_context`
+
+Effect:
+
+- the runtime no longer starts every tactical turn from a cold model context
+- Codex can accumulate local working context over sequential steps while still using your planner/validator memory plane
+
+Counter-session stabilization:
+
+- `counter_solver` keeps a separate Responses session from `tactical_solver`.
+- it now supports periodic reset with `OPENAI_COUNTER_SESSION_RESET_STEPS` (or `--counter-session-reset-steps`).
+- default is `8`; set `0` to disable resets.
+- each reset is logged as `response_context_reset` in `codex_dialogue.jsonl`.
+
 ## Recommended migration path
 
 ### Phase 1: Replace the model transport, not the architecture

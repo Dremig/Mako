@@ -21,11 +21,30 @@ This file is reserved for PentAGI-driven design input and integration notes.
 ### Runtime architecture now in repo
 - `task_interpreter.py`: priors and opener bias
 - `planner.py`: explicit subtasks and plan patch application
-- `deliberation.py`: recommender / corrector / judge
+- `deliberation.py`: tactical action selection (`codex tactical solver` by default, legacy recommender/corrector/judge retained as fallback)
 - `capability.py`: decide whether to reuse, write helper, install, or replan
 - `logistics.py`: perform support work outside challenge-step accounting
 - `reflector.py`: policy reflection that constrains and patches planning
 - `solver_shared.py`: runtime memory, validators, structured actions, execution reflection
+
+### Current responsibility split
+- `interpreter + planner`: produce route hypotheses, summaries, and discussion context for the current subtask
+- `codex tactical solver`: is the primary local solver and owns the concrete method for the current subtask (`command` / structured `action` / helper-first move)
+- `runtime guard`: owns preflight, validator, execution, artifact persistence, and final validation
+
+This is intentionally closer to the common human + Codex CTF workflow:
+- semantic reasoning stays outside the command loop as advisory context
+- the concrete next move is delegated to Codex
+
+### Advisory-not-command rule
+- planner/interpreter/reflector should discuss, not command
+- their outputs are useful because they summarize and hypothesize
+- they should not suppress Codex's local judgment with overly hard subtask constraints
+
+Operationally, this means:
+- planner suggestions are treated as `discussion cards`
+- Codex may agree, adapt, or reject local hints
+- runtime validation in Codex mode should keep only hard safety/budget bottoms, not semantic over-control
 
 ### Structured actions expanded
 - `http_probe_with_baseline`
@@ -77,3 +96,83 @@ This file is reserved for PentAGI-driven design input and integration notes.
    - `agent_exhausted_steps`
    - `flag_found`
 4. Keep capability acquisition conservative: prefer action reuse, then stdlib helper generation, and only then environment-changing installs.
+
+## NYU Web smoke rerun (2026-04-11)
+
+### Run setup
+- Harness: `AAAgentBench` branch `wjm/mako`
+- Platform: `nyu` (test split)
+- Solver: `mako`
+- Timeout per case: `900s`
+- Mako config: `--mako-max-steps 40 --mako-cmd-timeout 120`
+
+### Cases and outcomes
+1. `2021q-web-poem_collection`: `solved` in `695.69s`
+2. `2021q-web-no_pass_needed`: `timeout` at `900s`
+
+Result records:
+- `artifacts/aaagentbench/nyu/mako/2021q-web-poem_collection.json`
+- `artifacts/aaagentbench/nyu/mako/2021q-web-no_pass_needed.json`
+
+### Intended-exploit check for `poem_collection`
+- This solve is consistent with the intended path (LFI / path traversal).
+- Challenge-local evidence:
+  - `README.md` declares it as LFI.
+  - `src/poems/index.php` reads `$_GET["poem"]` via `file_get_contents(...)` without path sanitization.
+  - `solve.sh` uses `?poem=../flag.txt` directly.
+
+### What this rerun proves (and does not prove)
+- Proves:
+  - End-to-end pipeline is stable for at least one intended NYU Web case (`prepare -> solve -> validate -> cleanup`).
+  - Recent reliability work did not regress the successful path for simple LFI exploitation.
+- Does not prove:
+  - Single-case success cannot isolate which reliability feature contributed most (`HTTP retries`, `planner/deliberation fallback`, `preflight quality gate`).
+  - We still need multi-case A/B metrics to claim broad reliability gains.
+
+### Next validation pass
+1. Keep the same two targets and run with/without preflight gate for A/B comparison.
+2. Track per-run counters: `error rate`, `timeout rate`, `invalid command block count`, `autofix count`, `steps to first actionable exploit`.
+3. Add one more low-complexity Web case (`2021q-web-gatekeeping`) to reduce single-target bias.
+
+## Convergence diagnosis: taxonomy-to-control gap
+
+We already have rich error taxonomy in memory, but slow convergence shows the taxonomy is not yet acting as a hard control loop.
+
+### Why convergence is still slow even with good classification coverage
+1. Late trigger:
+   - Many labels are produced after expensive execution (`validator + retries + command timeout`) instead of before costly steps.
+2. Weak action mapping:
+   - Error labels are descriptive, but not always mapped to deterministic next actions.
+   - Example target behavior should be explicit: `service_unready -> readiness macro`, `validation_block -> command rewrite macro`.
+3. Soft constraints only:
+   - Labels are written to memory but often treated as hints; planner/solver can still pick near-identical low-yield actions.
+4. No budget coupling:
+   - Error types are not consistently tied to retry caps, per-step timeout, or forced phase transition thresholds.
+
+### Design target: state-transition contract
+Use error taxonomy as a strict transition table, not only reflection metadata.
+
+`(error_type, phase) -> {next_phase, allowed_actions, must_do, must_avoid, timeout_sec, retry_cap}`
+
+This contract should be enforced before next action selection so repeated low-gain loops are cut off early.
+
+### Minimum implementation checklist
+1. Add a transition registry in solver shared policy:
+   - canonical key: `(failure_cluster, current_phase)`.
+2. On each failed/low-gain step, resolve transition first, then gate planner/deliberation choices.
+3. Enforce hard `retry_cap` per `(cluster, subtask)` pair.
+4. Enforce dynamic timeout policy:
+   - infra/transient failures use shorter command timeout + quick retry.
+   - strategy failures force branch shift instead of same-action retry.
+5. Add low-gain circuit breaker:
+   - `N` consecutive `info_gain == 0` triggers mandatory branch switch/replan.
+
+### Metrics to validate that taxonomy is actually controlling behavior
+1. `classification_coverage`:
+   - fraction of failed steps mapped to a transition rule.
+2. `repeat_after_classification`:
+   - rate of same-action-family retries after a strategy-class failure.
+3. `time_to_branch_shift`:
+   - median wall-clock time from classified failure to next distinct strategy family.
+4. `timeout_without_transition`:
+   - number of run-level timeouts where no transition rule fired in the final `K` steps.

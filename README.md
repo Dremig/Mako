@@ -13,6 +13,42 @@ This repo is a local-first blackbox CTF workspace with two core layers:
 - `web_agent/`: interpreter + planner + deliberation + capability manager + logistics layer + shared runtime state
 - `docs/`: architecture and iteration notes (`init`, `pentagi`)
 
+File map:
+
+```text
+mako/
+  README.md
+  SKILL.md
+  .env.example
+  docs/
+    init.md
+    pentagi.md
+    codex.md
+    runtime_codex_contract.md
+  rag/
+    common.py
+    agent.py
+    index.py
+    query.py
+  web_agent/
+    cmd_agent.py
+    solver_shared.py
+    planner.py
+    deliberation.py
+    reflector.py
+    capability.py
+    logistics.py
+    task_interpreter.py
+  scripts/
+    run_web_agent.sh
+    build_rag_index.sh
+    ask_rag.sh
+  tests/
+    test_deliberation.py
+    test_policy_control.py
+    test_structured_actions.py
+```
+
 ## Design Docs
 
 - `docs/init.md`: current baseline thinking after removing legacy `sync/`

@@ -72,6 +72,26 @@ task_interpreter
 - Keep controller validation rules modular and testable.
 - Prefer module-based execution entrypoints (`python -m ...`) for import stability.
 
+## Pathological Repeat Guard
+- Exact duplicate suppression already existed; it only catches the same normalized command string.
+- A new semantic repeat guard now targets a different failure mode: "same surface, same command family, low gain, different wording".
+- Current trigger:
+  - recent consecutive steps stay on the same command family and same inferred surface
+  - the repeated steps produce low information gain
+  - or the agent stays in recon/probe too long without changing evidence type
+- Current behavior:
+  - write repeat state into memory as `repeat_guard.*`
+  - inject repeat constraints into planner/tactical context
+  - block another action when it is just the same semantic probe again
+- Current intent:
+  - do not override Codex route choice semantically
+  - do cut off cheap local loops that only rephrase the same probe
+  - force the next step to change one of:
+    - target surface
+    - evidence type
+    - exploit posture
+    - controllability test
+
 ## Current structured-action baseline
 - `http_probe_with_baseline`
 - `extract_html_attack_surface`

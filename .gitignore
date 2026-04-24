@@ -1,4 +1,5 @@
 .env
+auth.json
 rag_data/
 __pycache__/
 *.pyc
@@ -8,3 +9,4 @@ artifacts/
 *.sqlite-shm
 *.sqlite-wal
 .DS_Store
+.pytest_cache/
