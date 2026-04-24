@@ -103,6 +103,35 @@ class DeliberationTests(unittest.TestCase):
         self.assertIn("decision_rule", result)
         self.assertIn("should_challenge_current_route", result)
 
+    def test_choose_final_proposal_accepts_counter_challenge_when_materially_different(self) -> None:
+        recommender = {
+            "analysis": "Keep probing baseline endpoint.",
+            "decision": "command",
+            "phase": "probe",
+            "command": "curl -si $TARGET_URL/",
+            "action": {},
+            "success_signal": "response collected",
+            "next_if_fail": "",
+        }
+        corrected = {
+            "analysis": "Run discriminator on an alternate surface.",
+            "decision": "command",
+            "phase": "recon",
+            "command": "curl -si $TARGET_URL/robots.txt",
+            "action": {},
+            "success_signal": "robots content observed",
+            "next_if_fail": "",
+        }
+        corrector = {"verdict": "accept", "issues": [], "corrected": corrected}
+        final, judge = choose_final_proposal(
+            recommender=recommender,
+            corrector=corrector,
+            active_action="",
+            counter_solver={"should_challenge_current_route": True},
+        )
+        self.assertEqual(final["command"], corrected["command"])
+        self.assertEqual(judge["decision"], "accept_counter_challenge")
+
 
 if __name__ == "__main__":
     unittest.main()

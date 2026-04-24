@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from rag.common import chat_completion
-from web_agent.solver_shared import FAILURE_CLUSTERS, MemoryStore, extract_json, normalize_failure_reason
+from rag.common import json_completion
+from web_agent.solver_shared import FAILURE_CLUSTERS, MemoryStore, normalize_failure_reason
 
 STRICT_JSON_RULES = (
     "CRITICAL OUTPUT RULES:\n"
@@ -13,6 +13,18 @@ STRICT_JSON_RULES = (
     "Use double quotes for all keys/strings.\n"
     "If uncertain, keep schema fields with safe defaults instead of adding prose.\n"
 )
+REFLECTOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "phase_override": {"type": "string"},
+        "failure_cluster": {"type": "string"},
+        "must_do": {"type": "array", "items": {"type": "string"}},
+        "must_avoid": {"type": "array", "items": {"type": "string"}},
+        "rationale": {"type": "string"},
+    },
+    "required": ["phase_override", "failure_cluster", "must_do", "must_avoid", "rationale"],
+}
 
 
 def run_reflector_policy(
@@ -53,17 +65,18 @@ def run_reflector_policy(
         f"Recent observations:\n{recent_obs}\n\n"
         f"Recent history:\n{history_text}\n"
     )
-    parsed: dict[str, Any] | None = None
     for attempt in range(1, 4):
-        raw = chat_completion(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            temperature=0.1,
-        )
         try:
-            parsed = extract_json(raw)
+            parsed = json_completion(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                json_schema_name="reflector_policy",
+                json_schema=REFLECTOR_SCHEMA,
+                temperature=0.1,
+            )
             break
         except Exception:
             if attempt >= 3:
@@ -74,8 +87,6 @@ def run_reflector_policy(
                     "must_avoid": [],
                     "rationale": "fallback_after_json_parse_failure",
                 }
-            else:
-                user_prompt = user_prompt + "\n\nYour previous output was not valid JSON. " + STRICT_JSON_RULES
     out = {
         "phase_override": str(parsed.get("phase_override", "")).strip().lower(),
         "failure_cluster": str(parsed.get("failure_cluster", "none")).strip().lower() or "none",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Callable
 
 from rag.common import json_completion
@@ -77,6 +79,16 @@ COUNTER_SOLVER_SCHEMA: dict[str, Any] = {
 }
 
 
+@lru_cache(maxsize=1)
+def runtime_codex_contract_text() -> str:
+    path = Path(__file__).resolve().parents[1] / "docs" / "runtime_codex_contract.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+    return text[:4000]
+
+
 def _fallback_proposal() -> dict[str, Any]:
     return {
         "analysis": "Fallback proposal after repeated JSON parse failures.",
@@ -121,7 +133,9 @@ def _run_json_model(
     json_schema_name: str,
     json_schema: dict[str, Any],
     temperature: float,
+    response_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    last_error = ""
     for attempt in range(1, 4):
         try:
             return json_completion(
@@ -133,10 +147,12 @@ def _run_json_model(
                 json_schema_name=json_schema_name,
                 json_schema=json_schema,
                 temperature=temperature,
+                response_context=response_context,
             )
-        except Exception:
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {str(exc)[:260]}"
             if attempt >= 3:
-                return {}
+                return {"_error": last_error}
     return {}
 
 
@@ -147,6 +163,7 @@ def run_recommender(
     model: str,
     system_prompt: str,
     user_prompt: str,
+    response_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parsed = _run_json_model(
         base_url=base_url,
@@ -157,6 +174,7 @@ def run_recommender(
         json_schema_name="deliberation_payload",
         json_schema=PROPOSAL_SCHEMA,
         temperature=0.2,
+        response_context=response_context,
     )
     if not parsed:
         return _fallback_proposal()
@@ -179,6 +197,8 @@ def run_corrector(
     available_actions_text: str,
     memory_summary: str,
     recent_history: str,
+    counter_solver_notes: dict[str, Any] | None = None,
+    response_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     system_prompt = (
         "You are a sabotager-style corrector for a CTF execution agent.\n"
@@ -187,6 +207,10 @@ def run_corrector(
         "You may return a corrected command or a corrected structured action.\n"
         "Prefer the planner-suggested structured action when it fits the current subtask.\n"
         "Mark proposals that depend on optional libraries or unverified assumptions as fragile.\n"
+        "Treat counter-solver notes as adversarial evidence.\n"
+        "If counter-solver says should_challenge_current_route=true, you must either:\n"
+        "1) provide a concrete discriminator test as corrected plan and verdict=replace/misaligned, or\n"
+        "2) explicitly explain why recommender already runs that discriminator.\n"
         "Return ONLY JSON with schema:\n"
         "{"
         "\"verdict\":\"accept|fragile|misaligned|replace\","
@@ -214,6 +238,7 @@ def run_corrector(
         f"Available actions:\n{available_actions_text}\n\n"
         f"Memory summary:\n{memory_summary}\n\n"
         f"Recent history:\n{recent_history}\n\n"
+        f"Counter-solver notes:\n{json.dumps(counter_solver_notes or {}, ensure_ascii=False)}\n\n"
         f"Recommender proposal:\n{recommender}\n"
     )
     parsed = _run_json_model(
@@ -225,6 +250,7 @@ def run_corrector(
         json_schema_name="corrector_payload",
         json_schema=CORRECTOR_SCHEMA,
         temperature=0.1,
+        response_context=response_context,
     )
     verdict = str(parsed.get("verdict", "accept")).strip().lower() or "accept"
     corrected = parsed.get("corrected", recommender)
@@ -247,6 +273,7 @@ def choose_final_proposal(
     recommender: dict[str, Any],
     corrector: dict[str, Any],
     active_action: str,
+    counter_solver: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     verdict = str(corrector.get("verdict", "accept")).strip().lower()
     corrected = corrector.get("corrected", recommender)
@@ -264,6 +291,30 @@ def choose_final_proposal(
             "decision": "accept_corrected",
             "reason": f"corrector verdict={verdict}",
         }
+    should_challenge = bool((counter_solver or {}).get("should_challenge_current_route", False))
+    if should_challenge and judge.get("decision") == "accept_recommender":
+        rec_decision = str(recommender.get("decision", "")).strip().lower()
+        cor_decision = str(corrected.get("decision", "")).strip().lower()
+        rec_phase = str(recommender.get("phase", "")).strip().lower()
+        cor_phase = str(corrected.get("phase", "")).strip().lower()
+        rec_cmd = str(recommender.get("command", "")).strip()
+        cor_cmd = str(corrected.get("command", "")).strip()
+        rec_action = recommender.get("action", {}) if isinstance(recommender.get("action", {}), dict) else {}
+        cor_action = corrected.get("action", {}) if isinstance(corrected.get("action", {}), dict) else {}
+        rec_action_name = str(rec_action.get("name", "")).strip().lower()
+        cor_action_name = str(cor_action.get("name", "")).strip().lower()
+        materially_different = (
+            rec_decision != cor_decision
+            or rec_phase != cor_phase
+            or rec_cmd != cor_cmd
+            or rec_action_name != cor_action_name
+        )
+        if materially_different:
+            chosen = corrected
+            judge = {
+                "decision": "accept_counter_challenge",
+                "reason": "counter-solver requested route challenge and corrector produced a materially different test",
+            }
     if active_action and active_action in ACTION_NAMES:
         chosen, judge = force_planner_action_hint(chosen=chosen, active_action=active_action, base_judge=judge)
     return chosen, judge
@@ -308,6 +359,7 @@ def run_counter_solver(
     recent_history: str,
     recent_obs: str,
     retrieved_context: str,
+    response_context: dict[str, Any] | None = None,
     trace_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     system_prompt = (
@@ -352,6 +404,7 @@ def run_counter_solver(
         json_schema_name="counter_solver_payload",
         json_schema=COUNTER_SOLVER_SCHEMA,
         temperature=0.1,
+        response_context=response_context,
     )
     out = parsed if isinstance(parsed, dict) else {}
     if trace_hook is not None:
@@ -398,13 +451,17 @@ def run_tactical_solver(
     retrieved_context: str,
     counter_solver_notes: dict[str, Any] | None = None,
     collab_mode: bool = False,
+    response_context: dict[str, Any] | None = None,
     trace_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    contract_text = runtime_codex_contract_text()
+    contract_prefix = f"{contract_text}\n\n" if contract_text else ""
     if collab_mode:
         system_prompt = (
             "You are the primary tactical operator for a CTF web agent.\n"
             "You own route selection, branching, and retries.\n"
             "Planner/interpreter/reflector notes are optional discussion context, not control constraints.\n"
+            f"{contract_prefix}"
             "Choose the strongest next executable step based on runtime evidence.\n"
             "Prefer concrete progress over policy compliance text.\n"
             "Use structured actions when they clearly reduce friction; otherwise issue direct shell commands.\n"
@@ -412,6 +469,7 @@ def run_tactical_solver(
             "If input filters strip whitespace or the literal string admin, adapt SQLi payloads to those exact filters rather than switching exploit class.\n"
             "Do not use inline Python heredocs or large embedded scripts inside bash -lc; prefer short curl/bash commands or existing helper scripts.\n"
             "Avoid low-value repeated exploration and static-only targets unless they contain direct clues.\n"
+            "If notes say Repeat guard active, the next step must materially change surface, evidence type, or exploit posture rather than rephrasing the same probe.\n"
             "Return one concrete next step only.\n"
             "Return ONLY JSON schema:\n"
             "{"
@@ -433,6 +491,7 @@ def run_tactical_solver(
             "Interpreter, planner, and reflector are advisory discussion layers, not command authorities.\n"
             "Their job is to summarize hypotheses, context, and concerns so that you can solve the current subtask better.\n"
             "Your job is to choose the strongest next executable step for the CURRENT subtask.\n"
+            f"{contract_prefix}"
             "Think like a skilled human operator collaborating with external notes: read the notes, decide what matters, and act.\n"
             "Prefer one concrete action that materially advances the current subtask over broad speculation.\n"
             "Treat planner/interpreter content as discussion context. You may agree, adapt, or reject local hints when the evidence says they are weak.\n"
@@ -442,6 +501,7 @@ def run_tactical_solver(
             "When a page exposes a POST form with named fields, probe it with benign/default values before speculative exploit payloads.\n"
             "When baseline HTTP artifacts exist, prefer deterministic extraction of routes/forms/comments before guessing endpoints.\n"
             "Deprioritize static assets such as CSS/JS/images as primary attack targets unless they contain explicit challenge clues.\n"
+            "If notes say Repeat guard active, the next step must materially change surface, evidence type, or exploit posture rather than rephrasing the same probe.\n"
             "Return one concrete next step only.\n"
             "Return ONLY JSON schema:\n"
             "{"
@@ -500,6 +560,7 @@ def run_tactical_solver(
         json_schema_name="tactical_payload",
         json_schema=PROPOSAL_SCHEMA,
         temperature=0.15,
+        response_context=response_context,
     )
     chosen = _normalize_proposal_payload(parsed) if parsed else _fallback_proposal()
     if trace_hook is not None:

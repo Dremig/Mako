@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
-from rag.common import chat_completion
-from web_agent.solver_shared import MemoryStore, extract_json
+from rag.common import json_completion
+from web_agent.solver_shared import MemoryStore, available_action_names
 
 STRICT_JSON_RULES = (
     "CRITICAL OUTPUT RULES:\n"
@@ -15,6 +18,57 @@ STRICT_JSON_RULES = (
 )
 
 PHASES = {"recon", "probe", "exploit", "extract", "verify"}
+ACTION_NAMES = set(available_action_names())
+PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "rationale": {"type": "string"},
+        "subtasks": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "title": {"type": "string"},
+                    "phase": {"type": "string"},
+                    "goal": {"type": "string"},
+                    "success_signal": {"type": "string"},
+                    "suggested_action": {"type": "string"},
+                    "discussion": {"type": "string"},
+                    "open_questions": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["title", "phase", "goal", "success_signal", "suggested_action", "discussion", "open_questions"],
+            },
+        },
+    },
+    "required": ["rationale", "subtasks"],
+}
+
+
+@lru_cache(maxsize=1)
+def runtime_codex_contract_text() -> str:
+    path = Path(__file__).resolve().parents[1] / "docs" / "runtime_codex_contract.md"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except Exception:
+        return ""
+    return text[:4000]
+
+
+def _normalize_suggested_action(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    if text in ACTION_NAMES:
+        return text
+    head = text.split("(", 1)[0].strip()
+    if head in ACTION_NAMES:
+        return head
+    for name in ACTION_NAMES:
+        if re.search(rf"\b{re.escape(name)}\b", text):
+            return name
+    return ""
 
 
 def _normalize_plan_subtask(raw: dict[str, Any], idx: int) -> dict[str, Any]:
@@ -27,7 +81,13 @@ def _normalize_plan_subtask(raw: dict[str, Any], idx: int) -> dict[str, Any]:
         "phase": phase,
         "goal": str(raw.get("goal", "")).strip()[:240],
         "success_signal": str(raw.get("success_signal", "")).strip()[:200],
-        "suggested_action": str(raw.get("suggested_action", "")).strip()[:80],
+        "suggested_action": _normalize_suggested_action(raw.get("suggested_action", "")),
+        "discussion": str(raw.get("discussion", "")).strip()[:320],
+        "open_questions": [
+            str(item).strip()[:180]
+            for item in raw.get("open_questions", [])
+            if str(item).strip()
+        ][:4],
         "status": str(raw.get("status", "pending")).strip().lower() or "pending",
     }
 
@@ -45,6 +105,8 @@ def fallback_plan(memory: MemoryStore) -> dict[str, Any]:
             "goal": f"Collect one stable baseline response from {target}",
             "success_signal": "status line, headers, and body saved under artifact dir",
             "suggested_action": "http_probe_with_baseline",
+            "discussion": "Start with a deterministic baseline fetch so Codex can reason from real headers, body, redirects, and cookies instead of guessing routes.",
+            "open_questions": ["Does the root page expose forms, redirects, or identity hints?"],
             "status": "pending",
         }
     ]
@@ -57,6 +119,8 @@ def fallback_plan(memory: MemoryStore) -> dict[str, Any]:
                 "goal": "Determine whether the target is not-ready, non-HTTP, or protocol-mismatched",
                 "success_signal": "service classification and readiness facts recorded",
                 "suggested_action": "service_recovery_probe",
+                "discussion": "Only use this if the baseline HTTP behavior is empty, unstable, or clearly protocol-mismatched.",
+                "open_questions": ["Is the target speaking HTTP as expected?" ],
                 "status": "pending",
             }
         )
@@ -68,11 +132,13 @@ def fallback_plan(memory: MemoryStore) -> dict[str, Any]:
                 "phase": "extract",
                 "goal": "Turn the landing page into concrete follow-up endpoints and input names",
                 "success_signal": "endpoint.focus or form/input facts appear in memory",
-                "suggested_action": "extract_html_attack_surface",
+                "suggested_action": "",
+                "discussion": "Use the saved HTML to recover real forms, routes, and auth-relevant inputs before making exploit assumptions.",
+                "open_questions": ["Which route and form fields are actually present in the HTML?"],
                 "status": "pending",
             }
         )
-    if endpoint_focus:
+    if endpoint_focus and endpoint_focus != "/" and not re.search(r"\.(?:css|js|png|jpg|jpeg|gif|svg|ico|woff2?|ttf)(?:\?|$)", endpoint_focus, re.IGNORECASE):
         subtasks.append(
             {
                 "id": "focused-probe",
@@ -81,6 +147,8 @@ def fallback_plan(memory: MemoryStore) -> dict[str, Any]:
                 "goal": f"Validate controllability of {endpoint_focus}",
                 "success_signal": "new status, params, methods, or form fields discovered on focused endpoint",
                 "suggested_action": "",
+                "discussion": "Treat the focused endpoint as a candidate, not a command. Codex should decide whether it is truly higher value than other confirmed auth-relevant routes.",
+                "open_questions": [f"Is {endpoint_focus} truly the best next target?"],
                 "status": "pending",
             }
         )
@@ -92,6 +160,8 @@ def fallback_plan(memory: MemoryStore) -> dict[str, Any]:
             "goal": "Move from generic discovery into a concrete exploit route",
             "success_signal": "new auth/token/parameter/vulnerability signal appears",
             "suggested_action": "",
+            "discussion": "Use the strongest confirmed evidence, not generic route guessing, to choose the first exploit-oriented probe.",
+            "open_questions": ["What is the highest-value controllable input confirmed so far?"],
             "status": "pending",
         }
     )
@@ -120,20 +190,24 @@ def run_plan_worker(
     history_text: str,
     recent_obs: str,
     memory: MemoryStore,
+    response_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    contract_text = runtime_codex_contract_text()
+    contract_prefix = f"{contract_text}\n\n" if contract_text else ""
     system_prompt = (
         "You are a planning layer for a command-driven CTF agent.\n"
         "Produce a short ordered plan of subtasks before command execution.\n"
-        "The plan should be explicit enough that a solver can execute one subtask at a time.\n"
+        "The plan should be explicit enough that a solver can discuss and execute one subtask at a time.\n"
+        "You are not issuing hard commands. You are preparing advisory context for Codex.\n"
+        f"{contract_prefix}"
         "Prefer structured actions when they directly match the subtask goal.\n"
-        "Use `extract_html_attack_surface` for parsing downloaded HTML into routes/forms/files.\n"
         "Use `service_recovery_probe` when HTTP responses are empty, protocol-mismatched, or unstable.\n"
         f"{STRICT_JSON_RULES}"
         "Return ONLY JSON with schema:\n"
         "{"
         "\"rationale\":\"short text\","
         "\"subtasks\":["
-        "{\"title\":\"...\",\"phase\":\"recon|probe|exploit|extract|verify\",\"goal\":\"...\",\"success_signal\":\"...\",\"suggested_action\":\"\"}"
+        "{\"title\":\"...\",\"phase\":\"recon|probe|exploit|extract|verify\",\"goal\":\"...\",\"success_signal\":\"...\",\"suggested_action\":\"\",\"discussion\":\"...\",\"open_questions\":[\"...\"]}"
         "]"
         "}"
     )
@@ -151,22 +225,23 @@ def run_plan_worker(
         f"Recent history:\n{history_text}\n\n"
         f"Recent observations:\n{recent_obs}\n"
     )
-    parsed: dict[str, Any] | None = None
     for attempt in range(1, 4):
-        raw = chat_completion(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
-            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
-            temperature=0.1,
-        )
         try:
-            parsed = extract_json(raw)
+            parsed = json_completion(
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                json_schema_name="planner_payload",
+                json_schema=PLAN_SCHEMA,
+                temperature=0.1,
+                response_context=response_context,
+            )
             break
         except Exception:
             if attempt >= 3:
                 return fallback_plan(memory)
-            user_prompt = user_prompt + "\n\nYour previous output was not valid JSON. " + STRICT_JSON_RULES
     if not isinstance(parsed, dict):
         return fallback_plan(memory)
     subtasks = parsed.get("subtasks", [])
@@ -186,7 +261,8 @@ def plan_summary(plan: dict[str, Any]) -> str:
             continue
         rows.append(
             f"{idx}. [{subtask.get('status', 'pending')}] {subtask.get('phase', 'probe')} | "
-            f"{subtask.get('title', '')} | action={subtask.get('suggested_action', '') or 'none'}"
+            f"{subtask.get('title', '')} | action={subtask.get('suggested_action', '') or 'none'} | "
+            f"note={str(subtask.get('discussion', '')).strip()[:80] or 'none'}"
         )
     return "\n".join(rows) if rows else "none"
 
@@ -229,7 +305,7 @@ def build_plan_patch(
 
     fact_map = {key: value for key, value, _ in facts}
     endpoint_focus = fact_map.get("endpoint.focus") or ""
-    if endpoint_focus:
+    if endpoint_focus and not re.search(r"\.(?:css|js|png|jpg|jpeg|gif|svg|ico|woff2?|ttf)(?:\?|$)", endpoint_focus, re.IGNORECASE):
         patch["insert_after"].append(
             {
                 "title": f"Probe focused endpoint {endpoint_focus}",
@@ -237,6 +313,8 @@ def build_plan_patch(
                 "goal": "Validate the most promising newly extracted route before wider exploration",
                 "success_signal": "new method, parameter, auth, or response-diff signal appears",
                 "suggested_action": "",
+                "discussion": "Treat this as a candidate only if it looks like a real application route rather than a static asset.",
+                "open_questions": [f"Is {endpoint_focus} truly interactive or auth-relevant?"],
             }
         )
     if any(key.startswith("entrypoint.candidate.") for key in fact_map):
@@ -247,6 +325,8 @@ def build_plan_patch(
                 "goal": "Turn discovered input names into a controllable request surface",
                 "success_signal": "server returns parameter validation, next stage, or parser error",
                 "suggested_action": "",
+                "discussion": "Codex should prefer real observed forms or parameters over generic route guessing.",
+                "open_questions": ["Which observed input surface is the highest-value one to submit first?"],
             }
         )
     if fact_map.get("service.http.empty_reply") == "true" or fact_map.get("service.recovery.classification") == "service_not_ready_or_non_http":
@@ -257,6 +337,8 @@ def build_plan_patch(
                 "goal": "Classify the service and recover a stable HTTP response path",
                 "success_signal": "service classification or ready HTTP response recorded",
                 "suggested_action": "service_recovery_probe",
+                "discussion": "Use this only when the HTTP surface itself is unstable; otherwise return to the main route.",
+                "open_questions": ["Is service recovery still necessary after the latest response?"],
             }
         )
     if cluster in {"timeout_spiral", "low_gain_loop"}:
@@ -267,6 +349,8 @@ def build_plan_patch(
                 "goal": "Break repetition by changing command style or narrowing scope",
                 "success_signal": "new signal appears without repeating the previous command family",
                 "suggested_action": "",
+                "discussion": "This is a discussion fallback to escape repetition, not a direct instruction to broaden the route.",
+                "open_questions": ["What is the smallest fresh observable signal worth testing next?"],
             }
         )
     return patch

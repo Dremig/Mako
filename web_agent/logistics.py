@@ -4,8 +4,8 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from rag.common import chat_completion
-from web_agent.solver_shared import extract_json, strip_noise
+from rag.common import json_completion
+from web_agent.solver_shared import strip_noise
 
 STRICT_JSON_RULES = (
     "CRITICAL OUTPUT RULES:\n"
@@ -13,6 +13,15 @@ STRICT_JSON_RULES = (
     "Do not output markdown, code fences, comments, or any text before/after JSON.\n"
     "Use double quotes for all keys/strings.\n"
 )
+LOGISTICS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "strategy": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["strategy", "reason"],
+}
 
 
 def _normalize_target(raw: str) -> str:
@@ -91,14 +100,16 @@ def run_logistics_decider(
         f"Recent history:\n{recent_history}\n"
     )
     try:
-        raw = chat_completion(
+        parsed = json_completion(
             base_url=base_url,
             api_key=api_key,
             model=model,
-            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user}],
+            system_prompt=prompt,
+            user_prompt=user,
+            json_schema_name="logistics_decision",
+            json_schema=LOGISTICS_SCHEMA,
             temperature=0.1,
         )
-        parsed = extract_json(raw)
         if not isinstance(parsed, dict):
             raise RuntimeError("invalid logistics JSON")
         strategy = str(parsed.get("strategy", "")).strip().lower()

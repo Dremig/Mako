@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from rag.agent import hybrid_retrieve, load_index, short_history
-from rag.common import chat_completion, load_dotenv, require_env
+from rag.common import chat_completion, load_dotenv, require_openai_auth_token
 from web_agent.capability import resolve_capability_gap
 from web_agent.deliberation import choose_final_proposal, run_corrector, run_counter_solver, run_recommender, run_tactical_solver
 from web_agent.logistics import build_logistics_request, perform_logistics_request, run_logistics_decider
@@ -68,9 +68,18 @@ def utc_now_z() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _env_truthy(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _debate_enabled_default_true() -> bool:
+    raw = os.getenv("OPENAI_FORCE_DEBATE", "true").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_name(path.name + ".tmp")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     tmp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp_path.replace(path)
 
@@ -151,6 +160,70 @@ def summarize_run(
         temperature=0.1,
         response_context=response_context,
     )
+
+
+def resolve_valid_command(
+    *,
+    raw_cmd: str,
+    plan: dict[str, Any],
+    target: str,
+    memory: MemoryStore,
+    step: int,
+) -> str:
+    primary = str(raw_cmd).strip()
+    if primary:
+        try:
+            return validate_command(repair_helper_command(primary, memory))
+        except Exception as exc:
+            memory.add_event(step, "invalid_command_primary", str(exc)[:260])
+
+    fallback_candidates = [
+        str(plan.get("next_if_fail", "")).replace("{target}", target).strip(),
+        str(plan.get("command", "")).replace("{target}", target).strip(),
+        "curl -si $TARGET_URL/",
+    ]
+    for candidate in fallback_candidates:
+        if not candidate:
+            continue
+        try:
+            cmd = validate_command(repair_helper_command(candidate, memory))
+            memory.add_event(step, "invalid_command_fallback", f"fallback={cmd[:180]}")
+            return cmd
+        except Exception:
+            continue
+    # Ultimate hard fallback; this should always validate.
+    return "curl -si $TARGET_URL/"
+
+
+def extract_node_raw_commands(plan: dict[str, Any], target: str, max_substeps: int) -> list[str]:
+    commands: list[str] = []
+    raw_substeps = plan.get("substeps", [])
+    if isinstance(raw_substeps, list):
+        for item in raw_substeps:
+            cmd = str(item).replace("{target}", target).strip()
+            if cmd:
+                commands.append(cmd)
+
+    primary = str(plan.get("command", "")).replace("{target}", target).strip()
+    fallback = str(plan.get("next_if_fail", "")).replace("{target}", target).strip()
+    if primary:
+        commands.insert(0, primary)
+    if fallback:
+        commands.append(fallback)
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for cmd in commands:
+        key = normalize_command(cmd)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(cmd)
+        if len(deduped) >= max(1, int(max_substeps)):
+            break
+    if not deduped:
+        deduped.append("curl -si $TARGET_URL/")
+    return deduped
 
 
 def run_interpreter_worker(
@@ -267,6 +340,10 @@ def main() -> None:
         except ValueError:
             counter_session_reset_default = 8
     counter_session_reset_default = max(0, min(counter_session_reset_default, 100))
+    local_msgchain_default = True
+    local_msgchain_raw = os.getenv("OPENAI_LOCAL_MSGCHAIN", "").strip()
+    if local_msgchain_raw:
+        local_msgchain_default = local_msgchain_raw.lower() in {"1", "true", "yes", "on"}
 
     parser = argparse.ArgumentParser(description="Codex-style command agent for blackbox CTF web challenges")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
@@ -280,6 +357,20 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--mode", type=str, default="hybrid", choices=["dense", "bm25", "hybrid"])
     parser.add_argument("--alpha", type=float, default=0.65)
+    parser.add_argument("--max-substeps-per-node", type=int, default=4)
+    parser.add_argument("--min-node-info-gain", type=float, default=8.0)
+    parser.add_argument(
+        "--disable-rag",
+        action="store_true",
+        default=_env_truthy("OPENAI_DISABLE_RAG"),
+        help="Disable retrieval context completely (no index loading, no embeddings).",
+    )
+    parser.add_argument(
+        "--enable-rag",
+        action="store_false",
+        dest="disable_rag",
+        help="Enable retrieval context explicitly.",
+    )
     parser.add_argument("--memory-db", type=Path, default=Path("logs/agent_memory.sqlite"))
     parser.add_argument("--run-id", type=str, default="")
     parser.add_argument("--out", type=Path, default=Path("logs/cmd_agent_last_run.json"))
@@ -309,13 +400,25 @@ def main() -> None:
         default=os.getenv("OPENAI_SOLVER_MODE", "codex").strip().lower() or "codex",
         choices=["codex", "codex_pure", "codex_collab", "legacy"],
     )
+    parser.add_argument(
+        "--local-msgchain",
+        action="store_true",
+        default=local_msgchain_default,
+        help="Use local replay message chains as primary solver session state (provider-agnostic).",
+    )
+    parser.add_argument(
+        "--no-local-msgchain",
+        action="store_false",
+        dest="local_msgchain",
+        help="Disable local replay message chains and rely on provider-side session chaining when available.",
+    )
     args = parser.parse_args()
     counter_session_reset_steps = max(0, min(int(args.counter_session_reset_steps), 100))
 
     root = args.root.resolve()
     load_dotenv((root / args.env).resolve())
 
-    api_key = require_env("OPENAI_API_KEY")
+    api_key = require_openai_auth_token(root=root)
     base_url = os.getenv("OPENAI_BASE_URL", "https://yunwu.ai/v1").strip()
     chat_model = os.getenv("OPENAI_AGENT_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-5.2")).strip()
     embed_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
@@ -343,18 +446,25 @@ def main() -> None:
     memory.upsert_fact("objective", args.objective, 1.0, 0)
     memory.upsert_fact("hint", args.hint, 0.9, 0)
     memory.upsert_fact("counter.session_reset_steps", str(counter_session_reset_steps), 0.9, 0)
+    memory.upsert_fact("solver.local_msgchain", "true" if args.local_msgchain else "false", 0.95, 0)
     memory.upsert_fact("artifact.dir", str(artifact_dir), 0.95, 0)
     memory.upsert_fact("project.root", str(root), 0.95, 0)
     memory.ensure_flow(target=target, objective=args.objective, hint=args.hint, status="running")
     task_state_id = memory.create_task_state(title=args.objective, step_start=1, status="running")
 
     tools = discover_tools()
-    docs = load_index((root / args.index).resolve())
+    docs = [] if args.disable_rag else load_index((root / args.index).resolve())
     available_tools = sorted(tools.keys())
     memory.upsert_fact("tools.available", ",".join(available_tools), 0.95, 0)
+    memory.upsert_fact("retrieval.disabled", "true" if args.disable_rag else "false", 0.95, 0)
 
     print(f"[cmd-agent] target={target}")
-    print(f"[cmd-agent] run_id={run_id} model={chat_model} tools={','.join(available_tools) if available_tools else 'none'} docs={len(docs)}")
+    print(
+        f"[cmd-agent] run_id={run_id} model={chat_model} "
+        f"tools={','.join(available_tools) if available_tools else 'none'} "
+        f"docs={len(docs)} retrieval={'off' if args.disable_rag else 'on'} "
+        f"local_msgchain={'on' if args.local_msgchain else 'off'}"
+    )
 
     history: list[dict[str, Any]] = []
     capability_history: list[dict[str, Any]] = []
@@ -374,10 +484,27 @@ def main() -> None:
             base_url=base_url,
             model=chat_model,
         )
-        if any(bool(ctx.get("previous_response_id", "") or ctx.get("disable_previous_response_id", False)) for ctx in loaded_contexts.values()):
+        if any(
+            bool(
+                ctx.get("previous_response_id", "")
+                or ctx.get("disable_previous_response_id", False)
+                or ctx.get("use_local_msgchain", False)
+                or ctx.get("replay_messages", [])
+            )
+            for ctx in loaded_contexts.values()
+        ):
             response_contexts = loaded_contexts
             print(f"[cmd-agent] resumed response contexts from {latest_run_state_path}")
             memory.add_event(0, "response_context_resume", str(latest_run_state_path))
+    for role in list(response_contexts.keys()):
+        ctx = response_contexts.get(role, {})
+        if not isinstance(ctx, dict):
+            ctx = {}
+        if args.local_msgchain:
+            ctx["use_local_msgchain"] = True
+        else:
+            ctx.pop("use_local_msgchain", None)
+        response_contexts[role] = ctx
     response_context_seen: dict[str, str] = {}
     response_context_turns: dict[str, int] = {key: 0 for key in response_contexts.keys()}
     persist_plan(memory, current_plan, step=0)
@@ -500,7 +627,30 @@ def main() -> None:
     flush_run_state("initialized")
 
     try:
-        for step in range(1, max(1, args.max_steps) + 1):
+        step = 1
+        max_nodes = max(1, args.max_steps)
+        node_substep = 0
+        node_gain_acc = 0.0
+        while step <= max_nodes:
+            max_substeps = max(1, int(args.max_substeps_per_node))
+            if node_substep >= max_substeps:
+                memory.add_event(
+                    step,
+                    "node_retry_same_step",
+                    json.dumps(
+                        {
+                            "step": step,
+                            "substeps": node_substep,
+                            "node_gain_acc": round(node_gain_acc, 4),
+                            "min_node_info_gain": float(args.min_node_info_gain),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                node_substep = 0
+                # Keep node_gain_acc so the node cannot be considered complete without enough cumulative gain.
+                continue
+            node_substep += 1
             current_step = step
             flush_run_state("step_start")
             is_collab_mode = args.solver_mode == "codex_collab"
@@ -775,6 +925,7 @@ def main() -> None:
             corrector_review: dict[str, Any] = {}
             counter_solver_notes: dict[str, Any] = {}
             if args.solver_mode in {"codex", "codex_pure", "codex_collab"}:
+                force_debate = _debate_enabled_default_true()
                 planner_context_text = (
                     f"Plan rationale: {str(current_plan.get('rationale', '')).strip()}\n"
                     f"Current plan summary:\n{plan_summary(current_plan)}\n\n"
@@ -803,7 +954,7 @@ def main() -> None:
                         f"{args.solver_mode} mode: reflector policy disabled for this run.\n\n"
                         f"{repeat_guard_text}"
                     )
-                if is_collab_mode:
+                if force_debate:
                     maybe_reset_response_context(step, "counter_solver", "periodic_turn_limit")
                     counter_solver_notes = run_counter_solver(
                         base_url=base_url,
@@ -855,6 +1006,32 @@ def main() -> None:
                     trace_hook=(lambda payload: log_dialogue(step, str(payload.get("kind", "tactical")), payload)),
                 )
                 note_response_context(step, "tactical_solver")
+                if force_debate:
+                    corrector_review = run_corrector(
+                        base_url=base_url,
+                        api_key=api_key,
+                        model=chat_model,
+                        target=target,
+                        step=step,
+                        active_title=active_title,
+                        active_goal=active_goal,
+                        active_signal=active_signal,
+                        active_action=active_action,
+                        controller_reflection=controller_reflection,
+                        recommender=plan,
+                        available_actions_text=actions_text,
+                        memory_summary=memory_summary,
+                        recent_history=short_history(history),
+                        counter_solver_notes=counter_solver_notes,
+                        response_context=response_contexts["corrector"],
+                    )
+                    note_response_context(step, "corrector")
+                    plan, judge = choose_final_proposal(
+                        recommender=plan,
+                        corrector=corrector_review,
+                        active_action=active_action,
+                        counter_solver=counter_solver_notes,
+                    )
             else:
                 planner_prompt = (
                     "You are a Codex-style CTF command agent.\n"
@@ -877,7 +1054,6 @@ def main() -> None:
                     "When generating helper artifacts such as WAR files or cookie jars, write them under $AGENT_ARTIFACT_DIR or the current working directory with stable names, then reuse those paths instead of mktemp-only paths.\n"
                     "For Tomcat WAR generation, prefer the local helper script $PROJECT_ROOT/scripts/build_jsp_war.py over fragile shell heredocs.\n"
                     "For the full Tomcat Manager HTML upload chain, prefer the helper $PROJECT_ROOT/scripts/tomcat_manager_read_file.py when the goal is to read a server file through a deployed JSP.\n"
-                    "If the current subtask is about extracting routes/forms from downloaded HTML, prefer the structured action `extract_html_attack_surface` instead of ad-hoc parsing scripts or optional dependencies like bs4.\n"
                     "If the current subtask is about abnormal empty replies / readiness / protocol mismatch, prefer the structured action `service_recovery_probe`.\n"
                     "If the planner suggested a structured action, use it unless there is a clear stronger reason not to.\n"
                     "Return ONLY JSON schema:\n"
@@ -1013,7 +1189,7 @@ def main() -> None:
             next_if_fail = str(plan.get("next_if_fail", "")).strip()
             req = controller_reflection.get("requirements", {}) if isinstance(controller_reflection, dict) else {}
             require_signal = bool(req.get("require_explicit_success_signal", False))
-            subtask_title = analysis if analysis else f"{phase} step {step}"
+            subtask_title = analysis if analysis else f"{phase} step {step}.{node_substep}"
             subtask_state_id = memory.create_subtask_state(
             task_id=task_state_id,
             step=step,
@@ -1023,7 +1199,7 @@ def main() -> None:
         )
 
             if analysis:
-                print(f"[step {step}] plan: {analysis[:180]} (conf={confidence:.2f})")
+                print(f"[step {step}.{node_substep}] plan: {analysis[:180]} (conf={confidence:.2f})")
 
             if decision == "done":
                 solved_markers = [
@@ -1094,7 +1270,13 @@ def main() -> None:
                         fallback_cmd = str(plan.get("next_if_fail", "")).replace("{target}", target).strip()
                     raw_cmd = fallback_cmd or "curl -si $TARGET_URL/"
                     memory.add_event(step, "invalid_action_fallback", str(exc)[:300])
-            cmd = validate_command(repair_helper_command(raw_cmd, memory))
+            cmd = resolve_valid_command(
+                raw_cmd=raw_cmd,
+                plan=plan,
+                target=target,
+                memory=memory,
+                step=step,
+            )
             preflight = preflight_command_quality(
                 command=cmd,
                 action_name=active_action_name,
@@ -1145,29 +1327,19 @@ def main() -> None:
             if preflight_warnings:
                 memory.add_event(step, "preflight_warn", " | ".join(preflight_warnings)[:300])
             if require_signal and not success_signal:
-                history.append(
-                {
-                    "step": step,
-                    "phase": phase,
-                    "analysis": analysis,
-                    "confidence": confidence,
-                    "command": cmd,
-                    "signal": "blocked-by-controller: missing success_signal",
-                }
-            )
-                memory.add_event(step, "controller_block", "missing success_signal while controller requires explicit signal")
-                memory.finish_subtask_state(
-                subtask_state_id,
-                status="failed",
-                command=cmd,
-                return_code=1,
-                info_gain=0.0,
-                error="blocked-by-controller: missing success_signal",
-            )
-                print(f"[step {step}] controller blocked action: missing success_signal")
-                flush_run_state("controller_blocked")
-                time.sleep(0.2)
-                continue
+                fallback_signal = ""
+                if active_signal and active_signal != "none":
+                    fallback_signal = active_signal
+                elif active_goal and active_goal != "none":
+                    fallback_signal = f"observable evidence confirms progress toward: {active_goal[:160]}"
+                else:
+                    fallback_signal = "command returns a new observable signal (status/body/headers/route/form/param diff)"
+                success_signal = fallback_signal
+                memory.add_event(
+                    step,
+                    "controller_signal_fallback",
+                    f"missing success_signal; injected fallback={fallback_signal[:220]}",
+                )
             if not is_collab_mode:
                 validator_policy = (
                     {}
@@ -1260,6 +1432,26 @@ def main() -> None:
             for key, value, conf in facts:
                 memory.upsert_fact(key, value, conf, step)
 
+            # Generic web progression checkpoints inferred from observed evidence.
+            fact_keys = {str(k) for k, _, _ in facts}
+            if (
+                "artifact.html_file" in fact_keys
+                or any(k.startswith("url.seen.") for k in fact_keys)
+                or any(k.startswith("hint.comment.") for k in fact_keys)
+                or any(k.startswith("form.action.") for k in fact_keys)
+            ):
+                memory.upsert_fact("checkpoint.frontend_snapshot", "true", 0.95, step)
+            if (
+                any(k.startswith("form.action.") for k in fact_keys)
+                or "form.method" in fact_keys
+                or any(k.startswith("entrypoint.candidate.") for k in fact_keys)
+                or any(k.startswith("form.json_field.") for k in fact_keys)
+                or any(k.startswith("endpoint.requested.") for k in fact_keys)
+            ):
+                memory.upsert_fact("checkpoint.request_semantics", "true", 0.94, step)
+            if phase in {"probe", "exploit", "verify"} and float(gain or 0) >= 2.0:
+                memory.upsert_fact("checkpoint.control_diff", "true", 0.90, step)
+
             reflection = reflect_step(
             step=step,
             phase=phase,
@@ -1308,6 +1500,7 @@ def main() -> None:
 
             entry = {
             "step": step,
+            "substep": node_substep,
             "challenge_step": step,
             "phase": phase,
             "expected_phase": expected_phase,
@@ -1335,6 +1528,8 @@ def main() -> None:
             "stderr_head": stderr_clean[:1200],
             }
             history.append(entry)
+            node_gain_acc += float(gain or 0.0)
+            entry["node_gain_acc"] = node_gain_acc
             active_id = str(active_subtask.get("id", "")).strip()
             if active_id:
                 plan_patch = build_plan_patch(
@@ -1350,11 +1545,45 @@ def main() -> None:
                 entry["plan_patch"] = plan_patch
                 entry["plan_after"] = current_plan
                 memory.add_event(step, "plan_patch", json.dumps(plan_patch, ensure_ascii=False)[:3000])
-            print(f"[step {step}] {phase} rc={result['returncode']} cmd={cmd[:120]}")
+            print(
+                f"[step {step}.{node_substep}] {phase} rc={result['returncode']} "
+                f"gain={gain:.2f} node_gain={node_gain_acc:.2f} cmd={cmd[:120]}"
+            )
             flush_run_state("post_execute")
 
             if done:
                 break
+            if node_gain_acc >= float(args.min_node_info_gain):
+                memory.add_event(
+                    step,
+                    "node_completed",
+                    json.dumps(
+                        {
+                            "step": step,
+                            "substeps": node_substep,
+                            "node_gain_acc": round(node_gain_acc, 4),
+                            "min_node_info_gain": float(args.min_node_info_gain),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                step += 1
+                node_substep = 0
+                node_gain_acc = 0.0
+            else:
+                memory.add_event(
+                    step,
+                    "node_continue",
+                    json.dumps(
+                        {
+                            "step": step,
+                            "substep": node_substep,
+                            "node_gain_acc": round(node_gain_acc, 4),
+                            "min_node_info_gain": float(args.min_node_info_gain),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
             time.sleep(0.2)
     finally:
         if orchestrator is not None:

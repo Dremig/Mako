@@ -5,8 +5,8 @@ import re
 from typing import Any
 
 from rag.agent import hybrid_retrieve, short_history
-from rag.common import chat_completion
-from web_agent.solver_shared import MemoryStore, extract_json, recent_observations, task_prior_map
+from rag.common import json_completion
+from web_agent.solver_shared import MemoryStore, recent_observations, task_prior_map
 
 
 STRICT_JSON_RULES = (
@@ -16,6 +16,32 @@ STRICT_JSON_RULES = (
     "Use double quotes for all keys/strings.\n"
     "If uncertain, keep schema fields with safe defaults instead of adding prose.\n"
 )
+TASK_PRIOR_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "challenge_family": {"type": "string"},
+        "tech_stack": {"type": "array", "items": {"type": "string"}},
+        "primary_hypotheses": {"type": "array", "items": {"type": "string"}},
+        "secondary_hypotheses": {"type": "array", "items": {"type": "string"}},
+        "deprioritized": {"type": "array", "items": {"type": "string"}},
+        "exploit_chain": {"type": "array", "items": {"type": "string"}},
+        "recommended_first_steps": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number"},
+        "rationale": {"type": "string"},
+    },
+    "required": [
+        "challenge_family",
+        "tech_stack",
+        "primary_hypotheses",
+        "secondary_hypotheses",
+        "deprioritized",
+        "exploit_chain",
+        "recommended_first_steps",
+        "confidence",
+        "rationale",
+    ],
+}
 
 
 FAMILY_KEYWORDS = {
@@ -243,27 +269,22 @@ def run_task_interpreter(
     )
     try:
         prior = {}
-        local_user_prompt = user_prompt
         for attempt in range(1, 4):
-            raw = chat_completion(
-                base_url=base_url,
-                api_key=api_key,
-                model=model,
-                messages=[{"role": "system", "content": planner_prompt}, {"role": "user", "content": local_user_prompt}],
-                temperature=0.1,
-            )
             try:
-                prior = extract_json(raw)
+                prior = json_completion(
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=model,
+                    system_prompt=planner_prompt,
+                    user_prompt=user_prompt,
+                    json_schema_name="task_interpreter",
+                    json_schema=TASK_PRIOR_SCHEMA,
+                    temperature=0.1,
+                )
                 break
             except Exception:
                 if attempt >= 3:
                     prior = heuristic
-                else:
-                    local_user_prompt = (
-                        user_prompt
-                        + "\n\nYour previous output was not valid JSON. "
-                        + STRICT_JSON_RULES
-                    )
     except Exception:
         prior = heuristic
 

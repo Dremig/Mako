@@ -71,15 +71,6 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "content_type": "--content-type",
         },
     },
-    "extract_html_attack_surface": {
-        "script": "$PROJECT_ROOT/scripts/extract_html_attack_surface.py",
-        "required": ["html_file", "base_url"],
-        "arg_map": {
-            "html_file": "--html-file",
-            "base_url": "--base-url",
-            "out": "--out",
-        },
-    },
     "cookiejar_flow_fetch": {
         "script": "$PROJECT_ROOT/scripts/cookiejar_flow_fetch.py",
         "required": ["base_url", "cookiejar", "fetch_url"],
@@ -147,7 +138,6 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 ACTION_PHASE_HINTS: dict[str, str] = {
     "http_probe_with_baseline": "recon",
-    "extract_html_attack_surface": "extract",
     "cookiejar_flow_fetch": "probe",
     "service_recovery_probe": "probe",
     "multipart_upload_with_known_action": "exploit",
@@ -683,15 +673,6 @@ def action_defaults(name: str, memory: MemoryStore) -> dict[str, str]:
             "baseline_url": target,
             "timeout": "15",
         }
-    if name == "extract_html_attack_surface":
-        target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
-        artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
-        html_file = _best_html_artifact_path(memory) or str(Path(artifact_dir) / "root.body")
-        return {
-            "html_file": html_file,
-            "base_url": target,
-            "out": str(Path(artifact_dir) / "html_attack_surface.json"),
-        }
     if name == "cookiejar_flow_fetch":
         target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
         artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
@@ -1010,6 +991,148 @@ def normalize_command(command: str) -> str:
     cmd = cmd.replace("http://", "URL://").replace("https://", "URL://")
     cmd = re.sub(r"URL://[^/\s]+", "URL://HOST", cmd)
     return cmd
+
+
+def _command_surface(command: str) -> str:
+    normalized = normalize_command(command)
+    for pattern in (
+        r"(URL://HOST/[^\s'\";|&)]*)",
+        r"(--(?:url|base-url|fetch-url|action-url|login-url)\s+(URL://HOST[^\s'\";|&)]*))",
+        r"(--html-file\s+([^\s'\";|&)]*))",
+        r"(--target-file\s+([^\s'\";|&)]*))",
+    ):
+        match = re.search(pattern, normalized, re.IGNORECASE)
+        if not match:
+            continue
+        value = str(match.group(match.lastindex or 1)).strip()
+        value = re.sub(r"(=[^&\s]+)", "=VALUE", value)
+        value = re.sub(r"([?&][A-Za-z0-9_.-]+)=VALUE", r"\1=", value)
+        if value:
+            return value[:180]
+    action_name = infer_action_name_from_command(command)
+    if action_name:
+        return f"action:{action_name}"
+    return _command_family(command)
+
+
+def pathological_repeat_summary(history: list[dict[str, Any]], memory: MemoryStore, window: int = 6) -> dict[str, Any]:
+    relevant: list[dict[str, Any]] = []
+    for item in history:
+        command = str(item.get("command", "")).strip()
+        if not command:
+            continue
+        signal = str(item.get("signal", "")).strip().lower()
+        if signal in {"skipped-duplicate-command", "blocked-by-preflight", "blocked-by-validator"}:
+            continue
+        relevant.append(item)
+    tail = relevant[-max(1, int(window)) :]
+    if not tail:
+        return {
+            "active": False,
+            "reason": "",
+            "repeated_family": "",
+            "repeated_surface": "",
+            "repeat_count": 0,
+            "requirements": [],
+        }
+
+    last = tail[-1]
+    last_family = _command_family(str(last.get("command", "")))
+    last_surface = _command_surface(str(last.get("command", "")))
+    last_phase = str(last.get("phase", "")).strip().lower()
+    repeat_count = 0
+    low_gain_repeats = 0
+    for item in reversed(tail):
+        family = _command_family(str(item.get("command", "")))
+        surface = _command_surface(str(item.get("command", "")))
+        if family == last_family and surface == last_surface:
+            repeat_count += 1
+            if float(item.get("info_gain", 0) or 0) <= 1.0:
+                low_gain_repeats += 1
+            continue
+        break
+
+    same_phase_count = 0
+    if last_phase:
+        for item in reversed(tail):
+            if str(item.get("phase", "")).strip().lower() == last_phase:
+                same_phase_count += 1
+                continue
+            break
+
+    requirements: list[str] = []
+    active = False
+    reason = ""
+    if repeat_count >= 3 and low_gain_repeats >= 2:
+        active = True
+        reason = "semantic_repeat_same_surface"
+        requirements.extend(
+            [
+                "The next step must change target surface, not just command phrasing.",
+                "The next step must either test a new input/control point or execute a cheap exploit discriminator.",
+            ]
+        )
+    elif same_phase_count >= 4 and last_phase in {"recon", "probe"} and float(last.get("info_gain", 0) or 0) <= 1.0:
+        active = True
+        reason = "phase_stagnation"
+        requirements.extend(
+            [
+                "Do not spend another step on broad recon of the same route.",
+                "The next step must produce a different evidence type or directly test exploitability.",
+            ]
+        )
+
+    if active and (memory.has_prefix("entrypoint.confirmed.") or memory.has_prefix("vuln.signal.") or memory.has_prefix("hypothesis.state.vuln:")):
+        requirements.append("A candidate route already exists; prefer controllability or exploit execution over more reading.")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in requirements:
+        val = item.strip()
+        if val and val not in seen:
+            seen.add(val)
+            deduped.append(val)
+    return {
+        "active": active,
+        "reason": reason,
+        "repeated_family": last_family,
+        "repeated_surface": last_surface,
+        "repeat_count": repeat_count,
+        "same_phase_count": same_phase_count,
+        "requirements": deduped[:4],
+    }
+
+
+def repeat_guard_summary_text(summary: dict[str, Any]) -> str:
+    if not bool(summary.get("active")):
+        return "Repeat guard: inactive."
+    lines = [
+        f"Repeat guard active: {str(summary.get('reason', '')).strip() or 'loop detected'}",
+        f"- repeated family: {str(summary.get('repeated_family', '')).strip() or 'unknown'}",
+        f"- repeated surface: {str(summary.get('repeated_surface', '')).strip() or 'unknown'}",
+        f"- repeat count: {int(summary.get('repeat_count', 0) or 0)}",
+    ]
+    for item in summary.get("requirements", []):
+        val = str(item).strip()
+        if val:
+            lines.append(f"- {val}")
+    return "\n".join(lines)
+
+
+def repeated_command_guard_reason(command: str, history: list[dict[str, Any]], memory: MemoryStore) -> str:
+    summary = pathological_repeat_summary(history, memory)
+    if not bool(summary.get("active")):
+        return ""
+    current_family = _command_family(command)
+    current_surface = _command_surface(command)
+    repeated_family = str(summary.get("repeated_family", "")).strip()
+    repeated_surface = str(summary.get("repeated_surface", "")).strip()
+    if repeated_family and repeated_surface and current_family == repeated_family and current_surface == repeated_surface:
+        return (
+            "Repeat guard blocked another low-gain semantic repeat: "
+            f"family={current_family}, surface={current_surface}"
+        )
+    return ""
 
 
 def detect_vuln_signals(text: str) -> list[str]:
@@ -1555,6 +1678,11 @@ def derive_phase_state(memory: MemoryStore, history: list[dict[str, Any]]) -> tu
     has_missing_required = memory.get_fact("error.semantic.missing_required_parameter") == "true"
     has_method_not_allowed = memory.get_fact("error.semantic.method_not_allowed") == "true"
     has_auth_required = memory.get_fact("error.semantic.auth_required") == "true"
+    has_frontend_snapshot = memory.get_fact("checkpoint.frontend_snapshot") == "true"
+    has_request_semantics = memory.get_fact("checkpoint.request_semantics") == "true"
+    target_url = str(memory.get_fact("target") or "").strip().lower()
+    is_http_target = target_url.startswith("http://") or target_url.startswith("https://")
+    has_frontend_artifact = bool(memory.get_fact("artifact.html_file") or memory.get_fact("artifact.body_file"))
     has_invalid_param_format = memory.get_fact("error.semantic.invalid_parameter_format") == "true"
     focus_endpoint = memory.get_fact("endpoint.focus") or memory.get_fact("endpoint.last")
 
@@ -1887,7 +2015,7 @@ def _rule_semantic_recovery_discovery_drift(
     has_auth_required: bool,
     **_: Any,
 ) -> str | None:
-    if command_action in {"extract_html_attack_surface", "service_recovery_probe"}:
+    if command_action in {"service_recovery_probe"}:
         return None
     patterns = ("robots.txt", "sitemap.xml", ".well-known", "security.txt", "http-enum")
     is_drift = any(p in cmd for p in patterns)
@@ -1904,7 +2032,7 @@ def _rule_semantic_missing_required_focus(
     focus_endpoint: str,
     **_: Any,
 ) -> str | None:
-    if command_action in {"extract_html_attack_surface", "service_recovery_probe"}:
+    if command_action in {"service_recovery_probe"}:
         return None
     if has_missing_required and focus_endpoint and focus_endpoint not in cmd:
         return f"Missing-parameter recovery active; action must focus on {focus_endpoint}."
@@ -1939,13 +2067,26 @@ def validate_action(
     has_missing_required = memory.get_fact("error.semantic.missing_required_parameter") == "true"
     has_method_not_allowed = memory.get_fact("error.semantic.method_not_allowed") == "true"
     has_auth_required = memory.get_fact("error.semantic.auth_required") == "true"
+    has_frontend_snapshot = memory.get_fact("checkpoint.frontend_snapshot") == "true"
+    has_request_semantics = memory.get_fact("checkpoint.request_semantics") == "true"
+    target_url = str(memory.get_fact("target") or "").strip().lower()
+    is_http_target = target_url.startswith("http://") or target_url.startswith("https://")
+    has_frontend_artifact = bool(memory.get_fact("artifact.html_file") or memory.get_fact("artifact.body_file"))
 
     has_candidate_entrypoints = memory.has_prefix("entrypoint.candidate.") or memory.has_prefix("endpoint.candidate.")
-    critical_structured = command_action in {"extract_html_attack_surface", "service_recovery_probe"}
+    critical_structured = command_action in {"service_recovery_probe"}
     if expected_phase == "probe" and phase == "recon" and has_candidate_entrypoints and not critical_structured:
         return False, "Known entrypoint candidates exist; recon should not continue."
     if expected_phase in {"exploit", "extract"} and phase == "recon" and not critical_structured:
         return False, "A stronger signal exists; recon is no longer the best action."
+    if (
+        is_http_target
+        and has_frontend_artifact
+        and phase == "exploit"
+        and not critical_structured
+        and not (has_frontend_snapshot and has_request_semantics)
+    ):
+        return False, "Exploit blocked: observe frontend and extract request semantics first."
     if has_candidate_entrypoints and "sed -n" in cmd and "/tmp/index.html" in cmd:
         return False, "Re-reading the same page is low information gain after parameters are known."
     if phase in {"exploit", "extract"} and not critical_structured and not (
@@ -1955,6 +2096,9 @@ def validate_action(
             return False, "Exploit/extract requires a confirmed entrypoint or vulnerability signal."
     if history and "skipped-duplicate-command" in str(history[-1].get("signal", "")):
         return False, "Previous action was duplicate-like; choose a materially different command."
+    repeat_guard_reason = repeated_command_guard_reason(command, history, memory)
+    if repeat_guard_reason:
+        return False, repeat_guard_reason
     semantic_rule_ctx = {
         "cmd": cmd,
         "command_action": command_action,
