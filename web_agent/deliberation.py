@@ -439,6 +439,8 @@ def run_tactical_solver(
     current_plan_text: str,
     planner_discussion: str,
     planner_open_questions: list[str],
+    allowed_families_text: str,
+    branch_shift_candidate_text: str,
     available_tools_text: str,
     interpreter_notes_text: str,
     planner_context_text: str,
@@ -470,6 +472,8 @@ def run_tactical_solver(
             "Do not use inline Python heredocs or large embedded scripts inside bash -lc; prefer short curl/bash commands or existing helper scripts.\n"
             "Avoid low-value repeated exploration and static-only targets unless they contain direct clues.\n"
             "If notes say Repeat guard active, the next step must materially change surface, evidence type, or exploit posture rather than rephrasing the same probe.\n"
+            "If branch shift is active and an allowed-family set is provided, your next proposal must come from that set.\n"
+            "If branch-shift candidates are provided, choose one of those candidates or make only a minimal adaptation of one candidate.\n"
             "Return one concrete next step only.\n"
             "Return ONLY JSON schema:\n"
             "{"
@@ -502,6 +506,8 @@ def run_tactical_solver(
             "When baseline HTTP artifacts exist, prefer deterministic extraction of routes/forms/comments before guessing endpoints.\n"
             "Deprioritize static assets such as CSS/JS/images as primary attack targets unless they contain explicit challenge clues.\n"
             "If notes say Repeat guard active, the next step must materially change surface, evidence type, or exploit posture rather than rephrasing the same probe.\n"
+            "If branch shift is active and an allowed-family set is provided, your next proposal must come from that set.\n"
+            "If branch-shift candidates are provided, choose one of those candidates or make only a minimal adaptation of one candidate.\n"
             "Return one concrete next step only.\n"
             "Return ONLY JSON schema:\n"
             "{"
@@ -529,6 +535,8 @@ def run_tactical_solver(
         f"Current plan:\n{current_plan_text}\n\n"
         f"Planner discussion note:\n{planner_discussion or 'none'}\n\n"
         f"Planner open questions:\n" + ("\n".join(f"- {item}" for item in planner_open_questions) if planner_open_questions else "- none") + "\n\n"
+        f"Allowed families after branch shift: {allowed_families_text or 'none'}\n"
+        f"Branch-shift candidate set:\n{branch_shift_candidate_text or 'none'}\n"
         f"Available tools: {available_tools_text}\n"
         f"Interpreter notes:\n{interpreter_notes_text}\n\n"
         f"Planner context:\n{planner_context_text}\n\n"

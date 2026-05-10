@@ -5,6 +5,7 @@ import atexit
 import json
 import os
 from queue import Empty, Queue
+import shlex
 import signal
 import sys
 import threading
@@ -31,7 +32,10 @@ from web_agent.reflector import run_reflector_worker
 from web_agent.solver_shared import (
     available_actions_summary,
     canonical_action_name,
+    classify_command_family,
     compile_action_command,
+    derive_allowed_families_for_branch_shift,
+    derive_execution_monitor_policy,
     derive_gain_budget_policy,
     FLAG_RE,
     MemoryStore,
@@ -54,6 +58,7 @@ from web_agent.solver_shared import (
     run_shell_command,
     soften_controller_for_codex,
     strip_noise,
+    summarize_allowed_families,
     suggested_phase_for_action,
     task_prior_summary,
     update_hypotheses,
@@ -193,6 +198,169 @@ def resolve_valid_command(
             continue
     # Ultimate hard fallback; this should always validate.
     return "curl -si $TARGET_URL/"
+
+
+def branch_shift_candidates(
+    *,
+    allowed_families: list[str],
+    blocked_family: str,
+    target: str,
+    memory: MemoryStore,
+    root: Path,
+) -> list[dict[str, str]]:
+    endpoint_rows = memory.prefix_rows("endpoint.candidate.", max_items=6)
+    endpoint_candidates = [str(value).strip() for _, value, _, _ in endpoint_rows if str(value).strip()]
+    focus_endpoint = str(memory.get_fact("endpoint.focus") or memory.get_fact("endpoint.last") or "").strip()
+    html_file = str(memory.get_fact("artifact.html_file") or "").strip()
+    artifact_dir = str(memory.get_fact("artifact.dir") or "").strip()
+
+    def best_url() -> str:
+        for raw in [focus_endpoint] + endpoint_candidates:
+            val = str(raw).strip()
+            if not val:
+                continue
+            if val.startswith(("http://", "https://")):
+                return val
+            if val.startswith("/"):
+                return target.rstrip("/") + val
+        return target.rstrip("/") + "/"
+
+    preferred_url = best_url()
+    candidates: list[dict[str, str]] = []
+
+    def add(family: str, command: str, why: str) -> None:
+        fam = str(family).strip().lower()
+        cmd = str(command).strip()
+        if not fam or not cmd:
+            return
+        if fam == str(blocked_family).strip().lower():
+            return
+        if any(item["family"] == fam and item["command"] == cmd for item in candidates):
+            return
+        candidates.append({"family": fam, "command": cmd, "why": why[:180]})
+
+    for family in allowed_families:
+        fam = str(family).strip().lower()
+        if fam == "curl":
+            add("curl", f"curl -si {preferred_url}", f"Fetch focused candidate with curl: {preferred_url}")
+        elif fam == "bash":
+            add(
+                "bash",
+                (
+                    "bash -lc "
+                    + shlex.quote(
+                        f'curl -si {preferred_url} | sed -n "1,80p"'
+                    )
+                ),
+                f"Use a short bash pipeline to inspect focused candidate output: {preferred_url}",
+            )
+        elif fam == "bash:curl_flow":
+            add(
+                "bash:curl_flow",
+                (
+                    "bash -lc "
+                    + shlex.quote(
+                        f'curl -si {preferred_url} -o "$AGENT_ARTIFACT_DIR/branch_shift_body.txt" '
+                        f'-D "$AGENT_ARTIFACT_DIR/branch_shift_headers.txt"; '
+                        'sed -n "1,20p" "$AGENT_ARTIFACT_DIR/branch_shift_headers.txt"; '
+                        'echo "---"; sed -n "1,60p" "$AGENT_ARTIFACT_DIR/branch_shift_body.txt"'
+                    )
+                ),
+                "Persist headers/body to artifact dir for a different evidence type.",
+            )
+        elif fam == "sqlmap":
+            add(
+                "sqlmap",
+                f"sqlmap -u {shlex.quote(preferred_url)} --batch --crawl=1 --level=1 --risk=1",
+                "Try an automated injection-oriented route instead of another helper probe.",
+            )
+        elif fam == "python3:http_probe_with_baseline":
+            add(
+                fam,
+                (
+                    f"python3 {shlex.quote(str(root / 'scripts' / 'http_probe_with_baseline.py'))} "
+                    f"--url {shlex.quote(preferred_url)} --method GET --baseline-url {shlex.quote(target.rstrip('/'))} --timeout 15"
+                ),
+                "Run the structured baseline helper on a new candidate surface.",
+            )
+        elif fam == "python3:extract_html_attack_surface":
+            if html_file:
+                add(
+                    fam,
+                    (
+                        f"python3 {shlex.quote(str(root / 'scripts' / 'extract_html_attack_surface.py'))} "
+                        f"--html-file {shlex.quote(html_file)} --base-url {shlex.quote(target.rstrip('/'))}"
+                    ),
+                    "Extract concrete routes/forms from saved HTML instead of probing blindly.",
+                )
+        elif fam == "python3:service_recovery_probe":
+            out_file = str(Path(artifact_dir or "$AGENT_ARTIFACT_DIR") / "service_recovery_probe.json")
+            add(
+                fam,
+                (
+                    f"python3 {shlex.quote(str(root / 'scripts' / 'service_recovery_probe.py'))} "
+                    f"--url {shlex.quote(target.rstrip('/'))} --artifact-dir {shlex.quote(artifact_dir or '$AGENT_ARTIFACT_DIR')} "
+                    f"--attempts 3 --wait-seconds 12 --timeout 6 --out {shlex.quote(out_file)}"
+                ),
+                "Switch to readiness/protocol recovery instead of repeating HTTP helpers.",
+            )
+        elif fam == "wget":
+            add("wget", f"wget -S -O - {shlex.quote(preferred_url)}", f"Fetch focused candidate with wget: {preferred_url}")
+
+    return candidates[:4]
+
+
+def branch_shift_candidates_text(candidates: list[dict[str, str]]) -> str:
+    if not candidates:
+        return "none"
+    rows: list[str] = []
+    for idx, item in enumerate(candidates, start=1):
+        rows.append(
+            f"{idx}. family={item.get('family','')} why={item.get('why','')} cmd={item.get('command','')}"
+        )
+    return "\n".join(rows[:4])
+
+
+def apply_branch_shift_candidate_override(
+    *,
+    raw_cmd: str,
+    proposed_family: str,
+    forced_branch_shift_family: str,
+    forced_branch_shift_allowed_families: list[str],
+    forced_branch_shift_candidates: list[dict[str, str]],
+) -> tuple[str, str, dict[str, Any] | None]:
+    if not raw_cmd or not proposed_family:
+        return raw_cmd, proposed_family, None
+    if not forced_branch_shift_candidates or not forced_branch_shift_allowed_families:
+        return raw_cmd, proposed_family, None
+
+    normalized_proposed = proposed_family.strip().lower()
+    normalized_blocked = forced_branch_shift_family.strip().lower()
+    should_override = False
+    override_reason = ""
+    if normalized_blocked and normalized_proposed == normalized_blocked:
+        should_override = True
+        override_reason = "blocked_family"
+    elif normalized_proposed not in {item.strip().lower() for item in forced_branch_shift_allowed_families if item.strip()}:
+        should_override = True
+        override_reason = "outside_allowed_set"
+    if not should_override:
+        return raw_cmd, proposed_family, None
+
+    fallback_candidate = forced_branch_shift_candidates[0]
+    replacement_cmd = str(fallback_candidate.get("command", "")).strip()
+    replacement_family = str(fallback_candidate.get("family", "")).strip()
+    if not replacement_cmd:
+        return raw_cmd, proposed_family, None
+    event_payload = {
+        "reason": override_reason,
+        "rejected_family": proposed_family,
+        "blocked_family": forced_branch_shift_family,
+        "allowed_families": forced_branch_shift_allowed_families,
+        "replacement_family": replacement_family,
+        "replacement_cmd": replacement_cmd,
+    }
+    return replacement_cmd, replacement_family or proposed_family, event_payload
 
 
 def extract_node_raw_commands(plan: dict[str, Any], target: str, max_substeps: int) -> list[str]:
@@ -359,6 +527,21 @@ def main() -> None:
     parser.add_argument("--alpha", type=float, default=0.65)
     parser.add_argument("--max-substeps-per-node", type=int, default=4)
     parser.add_argument("--min-node-info-gain", type=float, default=8.0)
+    parser.add_argument("--max-tool-calls-per-run", type=int, default=80)
+    parser.add_argument(
+        "--execution-monitor-enabled",
+        action="store_true",
+        default=_env_truthy("OPENAI_EXECUTION_MONITOR_ENABLED"),
+        help="Enable execution monitor thresholds that trigger forced replan/branch shift.",
+    )
+    parser.add_argument(
+        "--no-execution-monitor",
+        action="store_false",
+        dest="execution_monitor_enabled",
+        help="Disable execution monitor thresholds.",
+    )
+    parser.add_argument("--execution-monitor-same-family-limit", type=int, default=4)
+    parser.add_argument("--execution-monitor-total-call-limit", type=int, default=10)
     parser.add_argument(
         "--disable-rag",
         action="store_true",
@@ -507,6 +690,20 @@ def main() -> None:
         response_contexts[role] = ctx
     response_context_seen: dict[str, str] = {}
     response_context_turns: dict[str, int] = {key: 0 for key in response_contexts.keys()}
+    max_tool_calls_per_run = max(1, int(args.max_tool_calls_per_run))
+    execution_monitor_same_family_limit = max(1, int(args.execution_monitor_same_family_limit))
+    execution_monitor_total_call_limit = max(1, int(args.execution_monitor_total_call_limit))
+    executed_tool_calls_total = 0
+    monitor_total_calls_since_replan = 0
+    monitor_same_family_streak = 0
+    monitor_last_family = ""
+    forced_branch_shift_family = ""
+    forced_branch_shift_allowed_families: list[str] = []
+    forced_branch_shift_candidates: list[dict[str, str]] = []
+    branch_shift_block_streak = 0
+    branch_shift_block_family = ""
+    terminated_by_budget = False
+    termination_reason = ""
     persist_plan(memory, current_plan, step=0)
     orchestrator = QueueWorkerOrchestrator(max_workers=2) if args.worker_mode == "threaded" else None
 
@@ -601,6 +798,23 @@ def main() -> None:
             "current_stage": current_stage,
             "current_plan": current_plan,
             "response_contexts": response_contexts,
+            "runtime_controls": {
+                "max_tool_calls_per_run": max_tool_calls_per_run,
+                "executed_tool_calls_total": executed_tool_calls_total,
+                "execution_monitor_enabled": bool(args.execution_monitor_enabled),
+                "execution_monitor_same_family_limit": execution_monitor_same_family_limit,
+                "execution_monitor_total_call_limit": execution_monitor_total_call_limit,
+                "monitor_total_calls_since_replan": monitor_total_calls_since_replan,
+                "monitor_same_family_streak": monitor_same_family_streak,
+                "monitor_last_family": monitor_last_family,
+                "forced_branch_shift_family": forced_branch_shift_family,
+                "forced_branch_shift_allowed_families": forced_branch_shift_allowed_families,
+                "forced_branch_shift_candidates": forced_branch_shift_candidates,
+                "branch_shift_block_streak": branch_shift_block_streak,
+                "branch_shift_block_family": branch_shift_block_family,
+                "terminated_by_budget": terminated_by_budget,
+                "termination_reason": termination_reason,
+            },
         }
 
     def flush_run_state(stage: str, *, final: bool = False) -> None:
@@ -631,12 +845,27 @@ def main() -> None:
         max_nodes = max(1, args.max_steps)
         node_substep = 0
         node_gain_acc = 0.0
+
+        def command_family(command: str) -> str:
+            return classify_command_family(command)
+
         while step <= max_nodes:
+            if executed_tool_calls_total >= max_tool_calls_per_run:
+                terminated_by_budget = True
+                termination_reason = (
+                    f"Hard tool-call budget reached: executed={executed_tool_calls_total}, "
+                    f"cap={max_tool_calls_per_run}."
+                )
+                memory.add_event(step, "hard_budget_stop", termination_reason)
+                final_report = termination_reason
+                flush_run_state("hard_budget_stop")
+                break
+
             max_substeps = max(1, int(args.max_substeps_per_node))
             if node_substep >= max_substeps:
                 memory.add_event(
                     step,
-                    "node_retry_same_step",
+                    "node_forced_advance",
                     json.dumps(
                         {
                             "step": step,
@@ -647,8 +876,10 @@ def main() -> None:
                         ensure_ascii=False,
                     ),
                 )
+                # Hard guard: do not stay on the same node forever when substep budget is exhausted.
+                step += 1
                 node_substep = 0
-                # Keep node_gain_acc so the node cannot be considered complete without enough cumulative gain.
+                node_gain_acc = 0.0
                 continue
             node_substep += 1
             current_step = step
@@ -798,7 +1029,17 @@ def main() -> None:
                 history=history,
                 expected_phase=derive_phase_state(memory, history)[0],
             )
+            monitor_policy = derive_execution_monitor_policy(
+                enabled=bool(args.execution_monitor_enabled),
+                same_family_streak=monitor_same_family_streak,
+                total_calls_since_replan=monitor_total_calls_since_replan,
+                last_family=monitor_last_family,
+                same_family_limit=execution_monitor_same_family_limit,
+                total_call_limit=execution_monitor_total_call_limit,
+                expected_phase=derive_phase_state(memory, history)[0],
+            )
             controller_reflection = merge_controller_with_gain_policy(controller_reflection, gain_policy)
+            controller_reflection = merge_controller_with_gain_policy(controller_reflection, monitor_policy)
             flush_run_state("post_reflection")
             if refresh_interpreter:
                 print(f"[step {step}] interpreter primary={','.join(prior.get('primary_hypotheses', [])[:3]) or 'none'} family={prior.get('challenge_family', 'unknown')}")
@@ -851,10 +1092,20 @@ def main() -> None:
                 expected_phase = phase_override
             controller_do = [str(item).strip() for item in controller_reflection.get("must_do", []) if str(item).strip()]
             controller_avoid = [str(item).strip() for item in controller_reflection.get("must_avoid", []) if str(item).strip()]
+            controller_allowed_families = [
+                str(item).strip().lower()
+                for item in controller_reflection.get("allowed_families", [])
+                if str(item).strip()
+            ]
             for item in controller_do[:3]:
                 constraints.append(f"Controller must-do: {item}")
             for item in controller_avoid[:3]:
                 constraints.append(f"Controller avoid: {item}")
+            if controller_allowed_families:
+                constraints.append(
+                    "Controller allowed families: "
+                    + summarize_allowed_families(controller_allowed_families)
+                )
             memory.upsert_fact(
                 "controller.reflect.last_failure_cluster",
                 str(controller_reflection.get("failure_cluster", "none"))[:80],
@@ -865,6 +1116,13 @@ def main() -> None:
                 memory.upsert_fact(f"controller.reflect.must_do.{i}", item, 0.90, step)
             for i, item in enumerate(controller_avoid[:3], start=1):
                 memory.upsert_fact(f"controller.reflect.must_avoid.{i}", item, 0.90, step)
+            if controller_allowed_families:
+                memory.upsert_fact(
+                    "controller.reflect.allowed_families",
+                    summarize_allowed_families(controller_allowed_families),
+                    0.91,
+                    step,
+                )
             memory.upsert_fact(
                 "controller.reflect.policy_source",
                 "llm+rule_repair",
@@ -877,10 +1135,71 @@ def main() -> None:
                 memory.upsert_fact("gain_budget.last_severity", str(gain_policy.get("severity", "none"))[:40], 0.95, step)
                 memory.upsert_fact("gain_budget.low_gain_streak", str(gain_policy.get("summary", {}).get("low_gain_streak", 0)), 0.95, step)
                 memory.upsert_fact("gain_budget.recent_total_gain", str(gain_policy.get("summary", {}).get("recent_total_gain", 0.0)), 0.95, step)
+            if monitor_policy.get("breach"):
+                memory.add_event(step, "execution_monitor", json.dumps(monitor_policy, ensure_ascii=False)[:3000])
+                memory.upsert_fact("execution_monitor.last_severity", str(monitor_policy.get("severity", "none"))[:40], 0.95, step)
+                memory.upsert_fact("execution_monitor.last_family", str(monitor_last_family)[:80], 0.92, step)
+                memory.upsert_fact("execution_monitor.total_calls_since_replan", str(monitor_total_calls_since_replan), 0.92, step)
             constraint_text = "\n".join(f"- {item}" for item in constraints) if constraints else "- none"
-            if gain_policy.get("requirements", {}).get("force_plan_refresh", False):
-                current_plan = {"rationale": "forced_replan_by_gain_budget", "subtasks": []}
+            gain_requirements = gain_policy.get("requirements", {}) if isinstance(gain_policy.get("requirements"), dict) else {}
+            monitor_requirements = monitor_policy.get("requirements", {}) if isinstance(monitor_policy.get("requirements"), dict) else {}
+            if bool(gain_requirements.get("force_branch_shift", False) or monitor_requirements.get("force_branch_shift", False)):
+                candidate_family = str(monitor_last_family).strip()
+                if not candidate_family:
+                    candidate_family = str(gain_policy.get("summary", {}).get("last_family", "")).strip()
+                if candidate_family:
+                    recent_forbidden_families: list[str] = []
+                    for item in reversed(history[-6:]):
+                        family = command_family(str(item.get("command", "")))
+                        if family and family not in recent_forbidden_families:
+                            recent_forbidden_families.append(family)
+                        if len(recent_forbidden_families) >= 3:
+                            break
+                    repeat_family = str(repeat_guard.get("repeated_family", "")).strip().lower()
+                    if repeat_family and repeat_family not in recent_forbidden_families:
+                        recent_forbidden_families.append(repeat_family)
+                    forced_branch_shift_family = candidate_family
+                    forced_branch_shift_allowed_families = derive_allowed_families_for_branch_shift(
+                        blocked_family=forced_branch_shift_family,
+                        available_tools=available_tools,
+                        forbidden_families=recent_forbidden_families,
+                    )
+                    forced_branch_shift_candidates = branch_shift_candidates(
+                        allowed_families=forced_branch_shift_allowed_families,
+                        blocked_family=forced_branch_shift_family,
+                        target=target,
+                        memory=memory,
+                        root=root,
+                    )
+                    controller_reflection["allowed_families"] = forced_branch_shift_allowed_families
+                    if recent_forbidden_families:
+                        memory.add_event(
+                            step,
+                            "force_branch_shift_forbidden_families",
+                            summarize_allowed_families(recent_forbidden_families),
+                        )
+                    memory.add_event(step, "force_branch_shift_family", forced_branch_shift_family[:120])
+                    if forced_branch_shift_allowed_families:
+                        memory.add_event(
+                            step,
+                            "force_branch_shift_allowed_families",
+                            summarize_allowed_families(forced_branch_shift_allowed_families),
+                        )
+                    if forced_branch_shift_candidates:
+                        memory.add_event(
+                            step,
+                            "force_branch_shift_candidates",
+                            branch_shift_candidates_text(forced_branch_shift_candidates)[:3000],
+                        )
+            if bool(gain_requirements.get("force_plan_refresh", False) or monitor_requirements.get("force_plan_refresh", False)):
+                current_plan = {"rationale": "forced_replan_by_policy", "subtasks": []}
                 persist_plan(memory, current_plan, step)
+                monitor_total_calls_since_replan = 0
+                monitor_same_family_streak = 0
+                monitor_last_family = ""
+                if not controller_reflection.get("allowed_families"):
+                    forced_branch_shift_allowed_families = []
+                    forced_branch_shift_candidates = []
             if (refresh_interpreter or not current_subtask(current_plan)) and not is_collab_mode:
                 current_stage = "planning"
                 current_plan = run_plan_worker(
@@ -926,11 +1245,17 @@ def main() -> None:
             counter_solver_notes: dict[str, Any] = {}
             if args.solver_mode in {"codex", "codex_pure", "codex_collab"}:
                 force_debate = _debate_enabled_default_true()
+                allowed_family_text = summarize_allowed_families(
+                    forced_branch_shift_allowed_families or controller_allowed_families
+                )
+                branch_shift_candidate_text = branch_shift_candidates_text(forced_branch_shift_candidates)
                 planner_context_text = (
                     f"Plan rationale: {str(current_plan.get('rationale', '')).strip()}\n"
                     f"Current plan summary:\n{plan_summary(current_plan)}\n\n"
                     f"Endpoint candidates:\n{endpoints_text}\n\n"
                     f"Comment hints:\n{hints_text}\n\n"
+                    f"Allowed families after branch shift: {allowed_family_text}\n\n"
+                    f"Branch-shift candidate set:\n{branch_shift_candidate_text}\n\n"
                     f"{repeat_guard_text}\n"
                 )
                 interpreter_notes_text = (
@@ -939,6 +1264,8 @@ def main() -> None:
                 )
                 reflector_notes_text = (
                     f"Controller rationale: {str(controller_reflection.get('rationale', '')).strip() or 'none'}\n"
+                    f"Allowed families after branch shift: {allowed_family_text}\n"
+                    f"Branch-shift candidate set:\n{branch_shift_candidate_text}\n"
                     f"Recent reflection summary:\n{reflect_summary}\n\n"
                     f"{repeat_guard_text}\n\n"
                     f"Soft notes from reflector:\n"
@@ -990,6 +1317,8 @@ def main() -> None:
                     current_plan_text=plan_summary(current_plan),
                     planner_discussion=active_discussion,
                     planner_open_questions=active_open_questions,
+                    allowed_families_text=allowed_family_text,
+                    branch_shift_candidate_text=branch_shift_candidate_text,
                     available_tools_text=json.dumps(available_tools, ensure_ascii=False),
                     interpreter_notes_text=interpreter_notes_text,
                     planner_context_text=planner_context_text,
@@ -1257,6 +1586,24 @@ def main() -> None:
             active_action_name = ""
             if isinstance(action_obj, dict):
                 active_action_name = canonical_action_name(str(action_obj.get("name", "")).strip())
+            proposed_family = command_family(raw_cmd) if raw_cmd else ""
+            raw_cmd, proposed_family, override_payload = apply_branch_shift_candidate_override(
+                raw_cmd=raw_cmd,
+                proposed_family=proposed_family,
+                forced_branch_shift_family=forced_branch_shift_family,
+                forced_branch_shift_allowed_families=forced_branch_shift_allowed_families,
+                forced_branch_shift_candidates=forced_branch_shift_candidates,
+            )
+            if override_payload:
+                memory.add_event(
+                    step,
+                    "branch_shift_candidate_override",
+                    json.dumps(override_payload, ensure_ascii=False)[:3000],
+                )
+                plan["command"] = raw_cmd
+                decision = "command"
+                action_obj = {"name": "", "args": {}}
+                active_action_name = ""
             if decision == "action":
                 try:
                     action_spec = validate_action_spec(action_obj if isinstance(action_obj, dict) else {}, memory)
@@ -1270,6 +1617,24 @@ def main() -> None:
                         fallback_cmd = str(plan.get("next_if_fail", "")).replace("{target}", target).strip()
                     raw_cmd = fallback_cmd or "curl -si $TARGET_URL/"
                     memory.add_event(step, "invalid_action_fallback", str(exc)[:300])
+            proposed_family = command_family(raw_cmd) if raw_cmd else ""
+            raw_cmd, proposed_family, override_payload = apply_branch_shift_candidate_override(
+                raw_cmd=raw_cmd,
+                proposed_family=proposed_family,
+                forced_branch_shift_family=forced_branch_shift_family,
+                forced_branch_shift_allowed_families=forced_branch_shift_allowed_families,
+                forced_branch_shift_candidates=forced_branch_shift_candidates,
+            )
+            if override_payload:
+                memory.add_event(
+                    step,
+                    "branch_shift_candidate_override",
+                    json.dumps(override_payload, ensure_ascii=False)[:3000],
+                )
+                plan["command"] = raw_cmd
+                decision = "command"
+                action_obj = {"name": "", "args": {}}
+                active_action_name = ""
             cmd = resolve_valid_command(
                 raw_cmd=raw_cmd,
                 plan=plan,
@@ -1341,6 +1706,52 @@ def main() -> None:
                     f"missing success_signal; injected fallback={fallback_signal[:220]}",
                 )
             if not is_collab_mode:
+                current_family = command_family(cmd)
+                if forced_branch_shift_family and current_family == forced_branch_shift_family:
+                    reason = (
+                        f"forced branch shift active: blocked family `{forced_branch_shift_family}`; "
+                        f"allowed={summarize_allowed_families(forced_branch_shift_allowed_families)}"
+                    )
+                    if branch_shift_block_family == forced_branch_shift_family:
+                        branch_shift_block_streak += 1
+                    else:
+                        branch_shift_block_family = forced_branch_shift_family
+                        branch_shift_block_streak = 1
+                    history.append(
+                        {
+                            "step": step,
+                            "phase": phase,
+                            "analysis": analysis,
+                            "confidence": confidence,
+                            "command": cmd,
+                            "signal": f"blocked-by-branch-shift: {reason}",
+                        }
+                    )
+                    memory.add_event(step, "branch_shift_block", reason)
+                    memory.finish_subtask_state(
+                        subtask_state_id,
+                        status="failed",
+                        command=cmd,
+                        return_code=1,
+                        info_gain=0.0,
+                        error=f"blocked-by-branch-shift: {reason}",
+                    )
+                    print(f"[step {step}] branch-shift blocked action: {reason}")
+                    if branch_shift_block_streak >= 3:
+                        terminated_by_budget = True
+                        termination_reason = (
+                            "Forced branch shift could not find an alternative family after "
+                            f"{branch_shift_block_streak} blocked proposals for `{forced_branch_shift_family}`."
+                        )
+                        memory.add_event(step, "branch_shift_circuit_break", termination_reason)
+                        final_report = termination_reason
+                        flush_run_state("branch_shift_circuit_break")
+                        break
+                    flush_run_state("branch_shift_blocked")
+                    time.sleep(0.2)
+                    continue
+                branch_shift_block_streak = 0
+                branch_shift_block_family = ""
                 validator_policy = (
                     {}
                     if args.solver_mode == "codex_pure"
@@ -1416,6 +1827,18 @@ def main() -> None:
             exec_timeout = min(args.cmd_timeout, int(gain_policy.get("timeout_cap_sec", 0) or args.cmd_timeout))
             flush_run_state("pre_execute")
             result = run_shell_command(cmd, timeout=exec_timeout, env=env, cwd=artifact_dir)
+            executed_tool_calls_total += 1
+            monitor_total_calls_since_replan += 1
+            executed_family = command_family(cmd)
+            if executed_family == monitor_last_family:
+                monitor_same_family_streak += 1
+            else:
+                monitor_same_family_streak = 1
+                monitor_last_family = executed_family
+            if forced_branch_shift_family and executed_family and executed_family != forced_branch_shift_family:
+                memory.add_event(step, "branch_shift_completed", f"{forced_branch_shift_family}->{executed_family}")
+                forced_branch_shift_family = ""
+                forced_branch_shift_allowed_families = []
             stdout_clean = strip_noise(result["stdout"])
             stderr_clean = strip_noise(result["stderr"])
             merged = (stdout_clean + "\n" + stderr_clean)[:120000]

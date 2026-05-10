@@ -4,11 +4,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from web_agent.cmd_agent import apply_branch_shift_candidate_override
 from web_agent.solver_shared import (
+    classify_command_family,
     cluster_for_failure_reason,
+    derive_allowed_families_for_branch_shift,
+    derive_execution_monitor_policy,
     derive_gain_budget_policy,
     merge_controller_with_gain_policy,
     normalize_failure_reason,
+    pathological_repeat_summary,
     validate_action,
     MemoryStore,
 )
@@ -75,6 +80,20 @@ class PolicyControlTests(unittest.TestCase):
             )
             self.assertFalse(ok)
             self.assertIn("command family change", reason)
+
+    def test_validate_action_blocks_family_outside_allowed_set(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            memory = MemoryStore(Path(td) / "mem.sqlite", run_id="t2b")
+            ok, reason = validate_action(
+                phase="probe",
+                expected_phase="probe",
+                command="python3 /tmp/http_probe_with_baseline.py --url $TARGET_URL",
+                memory=memory,
+                history=[],
+                controller_reflection={"allowed_families": ["curl", "sqlmap"]},
+            )
+            self.assertFalse(ok)
+            self.assertIn("allowed set", reason)
 
     def test_validate_action_controller_rule_registry_paths(self) -> None:
         cases = [
@@ -144,6 +163,95 @@ class PolicyControlTests(unittest.TestCase):
         self.assertTrue(policy["requirements"]["force_branch_shift"])
         self.assertLessEqual(int(policy["timeout_cap_sec"]), 20)
 
+    def test_execution_monitor_policy_same_family_breach(self) -> None:
+        policy = derive_execution_monitor_policy(
+            enabled=True,
+            same_family_streak=4,
+            total_calls_since_replan=4,
+            last_family="curl",
+            same_family_limit=4,
+            total_call_limit=10,
+            expected_phase="probe",
+        )
+        self.assertTrue(policy["breach"])
+        self.assertEqual(policy["severity"], "hard")
+        self.assertTrue(policy["requirements"]["force_plan_refresh"])
+        self.assertTrue(policy["requirements"]["force_branch_shift"])
+        self.assertIn("curl", " ".join(policy["must_avoid"]))
+
+    def test_execution_monitor_policy_total_call_breach(self) -> None:
+        policy = derive_execution_monitor_policy(
+            enabled=True,
+            same_family_streak=1,
+            total_calls_since_replan=10,
+            last_family="ffuf",
+            same_family_limit=4,
+            total_call_limit=10,
+            expected_phase="recon",
+        )
+        self.assertTrue(policy["breach"])
+        self.assertEqual(policy["severity"], "soft")
+        self.assertTrue(policy["requirements"]["force_plan_refresh"])
+        self.assertFalse(policy["requirements"]["force_branch_shift"])
+
+    def test_command_family_is_intent_sensitive_for_python_helpers(self) -> None:
+        self.assertEqual(
+            classify_command_family("python3 /repo/scripts/http_probe_with_baseline.py --url $TARGET_URL"),
+            "python3:http_probe_with_baseline",
+        )
+        self.assertEqual(
+            classify_command_family("python3 /repo/scripts/extract_html_attack_surface.py --html-file page.html"),
+            "python3:extract_html_attack_surface",
+        )
+
+    def test_branch_shift_allowed_families_avoid_blocked_family(self) -> None:
+        allowed = derive_allowed_families_for_branch_shift(
+            blocked_family="python3:http_probe_with_baseline",
+            available_tools=["curl", "bash", "python3", "sqlmap"],
+        )
+        self.assertNotIn("python3:http_probe_with_baseline", allowed)
+        self.assertIn("curl", allowed)
+
+    def test_branch_shift_allowed_families_avoid_recent_forbidden_families(self) -> None:
+        allowed = derive_allowed_families_for_branch_shift(
+            blocked_family="python3:http_probe_with_baseline",
+            available_tools=["curl", "bash", "python3", "sqlmap"],
+            forbidden_families=["curl", "bash"],
+        )
+        self.assertNotIn("python3:http_probe_with_baseline", allowed)
+        self.assertNotIn("curl", allowed)
+        self.assertNotIn("bash", allowed)
+        self.assertEqual(allowed, ["python3:service_recovery_probe", "sqlmap"])
+
+    def test_branch_shift_candidate_override_rewrites_blocked_family(self) -> None:
+        cmd, family, payload = apply_branch_shift_candidate_override(
+            raw_cmd="python3 /repo/scripts/http_probe_with_baseline.py --url $TARGET_URL",
+            proposed_family="python3:http_probe_with_baseline",
+            forced_branch_shift_family="python3:http_probe_with_baseline",
+            forced_branch_shift_allowed_families=["curl", "sqlmap"],
+            forced_branch_shift_candidates=[
+                {"family": "curl", "command": "curl -si $TARGET_URL/", "why": "switch surface"}
+            ],
+        )
+        self.assertEqual(cmd, "curl -si $TARGET_URL/")
+        self.assertEqual(family, "curl")
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload["reason"], "blocked_family")
+
+    def test_branch_shift_candidate_override_keeps_allowed_family(self) -> None:
+        cmd, family, payload = apply_branch_shift_candidate_override(
+            raw_cmd="curl -si $TARGET_URL/",
+            proposed_family="curl",
+            forced_branch_shift_family="python3:http_probe_with_baseline",
+            forced_branch_shift_allowed_families=["curl", "sqlmap"],
+            forced_branch_shift_candidates=[
+                {"family": "curl", "command": "curl -si $TARGET_URL/", "why": "switch surface"}
+            ],
+        )
+        self.assertEqual(cmd, "curl -si $TARGET_URL/")
+        self.assertEqual(family, "curl")
+        self.assertIsNone(payload)
+
     def test_merge_controller_with_gain_policy_promotes_hard_requirements(self) -> None:
         controller = {
             "failure_cluster": "none",
@@ -171,6 +279,56 @@ class PolicyControlTests(unittest.TestCase):
         self.assertTrue(merged["requirements"]["force_plan_refresh"])
         self.assertIn("Force a branch shift.", merged["must_do"])
         self.assertIn("hard low-gain budget breach", merged["rationale"])
+
+    def test_merge_controller_with_execution_monitor_policy_promotes_requirements(self) -> None:
+        controller = {
+            "failure_cluster": "none",
+            "must_do": [],
+            "must_avoid": [],
+            "requirements": {},
+            "rationale": "base_policy",
+        }
+        monitor_policy = derive_execution_monitor_policy(
+            enabled=True,
+            same_family_streak=4,
+            total_calls_since_replan=4,
+            last_family="curl",
+            same_family_limit=4,
+            total_call_limit=10,
+            expected_phase="probe",
+        )
+        merged = merge_controller_with_gain_policy(controller, monitor_policy)
+        self.assertEqual(merged["failure_cluster"], "low_gain_loop")
+        self.assertTrue(merged["requirements"]["change_command_family"])
+        self.assertTrue(merged["requirements"]["force_branch_shift"])
+        self.assertIn("Execution monitor triggered", " ".join(merged["must_do"]))
+
+    def test_pathological_repeat_counts_validator_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            memory = MemoryStore(Path(td) / "mem.sqlite", run_id="t4")
+            history = [
+                {
+                    "command": "curl -si $TARGET_URL/login",
+                    "signal": "blocked-by-validator: repeated command family",
+                    "info_gain": 0,
+                    "phase": "probe",
+                },
+                {
+                    "command": "curl -si $TARGET_URL/login",
+                    "signal": "blocked-by-validator: repeated command family",
+                    "info_gain": 0,
+                    "phase": "probe",
+                },
+                {
+                    "command": "curl -si $TARGET_URL/login",
+                    "signal": "blocked-by-validator: repeated command family",
+                    "info_gain": 0,
+                    "phase": "probe",
+                },
+            ]
+            summary = pathological_repeat_summary(history, memory)
+            self.assertTrue(summary["active"])
+            self.assertEqual(summary["reason"], "semantic_repeat_same_surface")
 
 
 if __name__ == "__main__":

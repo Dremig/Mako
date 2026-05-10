@@ -596,6 +596,91 @@ def infer_action_name_from_command(command: str) -> str:
     return ""
 
 
+def summarize_allowed_families(values: list[str] | tuple[str, ...]) -> str:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in values:
+        val = str(item).strip()
+        if not val or val in seen:
+            continue
+        seen.add(val)
+        out.append(val)
+    return ", ".join(out) if out else "none"
+
+
+def derive_allowed_families_for_branch_shift(
+    *,
+    blocked_family: str,
+    available_tools: list[str] | tuple[str, ...],
+    forbidden_families: list[str] | tuple[str, ...] | None = None,
+) -> list[str]:
+    blocked = str(blocked_family).strip().lower()
+    forbidden = {
+        str(item).strip().lower()
+        for item in (forbidden_families or [])
+        if str(item).strip()
+    }
+    forbidden.add(blocked)
+    tools = {str(item).strip().lower() for item in available_tools if str(item).strip()}
+    candidates: list[str] = []
+
+    def add(value: str) -> None:
+        val = str(value).strip().lower()
+        if not val or val in forbidden or val in candidates:
+            return
+        candidates.append(val)
+
+    if blocked.startswith("python3:http_probe_with_baseline") or blocked.startswith("python3:extract_html_attack_surface"):
+        add("curl")
+        add("bash")
+        add("python3:service_recovery_probe")
+        add("sqlmap")
+    elif blocked.startswith("python3:service_recovery_probe"):
+        add("curl")
+        add("bash")
+        add("python3:http_probe_with_baseline")
+        add("nmap")
+    elif blocked.startswith("curl"):
+        add("python3:http_probe_with_baseline")
+        add("python3:extract_html_attack_surface")
+        add("bash")
+        add("sqlmap")
+    elif blocked.startswith("sqlmap"):
+        add("curl")
+        add("bash")
+        add("python3:http_probe_with_baseline")
+    elif blocked.startswith("bash"):
+        add("curl")
+        add("python3:http_probe_with_baseline")
+        add("python3:extract_html_attack_surface")
+    else:
+        add("curl")
+        add("bash")
+        add("sqlmap")
+        add("python3:http_probe_with_baseline")
+        add("python3:extract_html_attack_surface")
+        add("python3:service_recovery_probe")
+
+    filtered: list[str] = []
+    for item in candidates:
+        if item.startswith("python3:"):
+            script_name = item.split(":", 1)[1]
+            if "python3" not in tools and "python" not in tools:
+                continue
+            if script_name not in ACTION_SCHEMAS:
+                continue
+        elif item == "sqlmap" and "sqlmap" not in tools:
+            continue
+        elif item == "nmap" and "nmap" not in tools:
+            continue
+        elif item == "curl" and "curl" not in tools:
+            continue
+        elif item == "bash" and "bash" not in tools and "sh" not in tools:
+            continue
+        filtered.append(item)
+    return filtered[:4]
+
+
 def suggested_phase_for_action(action_name: str, current_phase: str) -> str:
     canonical = canonical_action_name(action_name)
     if not canonical:
@@ -1022,7 +1107,7 @@ def pathological_repeat_summary(history: list[dict[str, Any]], memory: MemorySto
         if not command:
             continue
         signal = str(item.get("signal", "")).strip().lower()
-        if signal in {"skipped-duplicate-command", "blocked-by-preflight", "blocked-by-validator"}:
+        if signal in {"skipped-duplicate-command"}:
             continue
         relevant.append(item)
     tail = relevant[-max(1, int(window)) :]
@@ -1825,6 +1910,94 @@ def gain_window_summary(history: list[dict[str, Any]], window: int = 6) -> dict[
     }
 
 
+def derive_execution_monitor_policy(
+    *,
+    enabled: bool,
+    same_family_streak: int,
+    total_calls_since_replan: int,
+    last_family: str,
+    same_family_limit: int,
+    total_call_limit: int,
+    expected_phase: str,
+) -> dict[str, Any]:
+    safe_same_limit = max(1, int(same_family_limit))
+    safe_total_limit = max(1, int(total_call_limit))
+    out = {
+        "breach": False,
+        "severity": "none",
+        "failure_cluster": "none",
+        "phase_override": "",
+        "must_do": [],
+        "must_avoid": [],
+        "allowed_families": [],
+        "requirements": {
+            "change_command_family": False,
+            "require_explicit_success_signal": False,
+            "force_plan_refresh": False,
+            "force_branch_shift": False,
+        },
+        "timeout_cap_sec": 0,
+        "rationale": "",
+        "summary": {
+            "same_family_streak": int(same_family_streak),
+            "same_family_limit": safe_same_limit,
+            "total_calls_since_replan": int(total_calls_since_replan),
+            "total_call_limit": safe_total_limit,
+            "last_family": str(last_family).strip(),
+        },
+    }
+    if not enabled:
+        return out
+
+    family = str(last_family).strip()
+    if family and int(same_family_streak) >= safe_same_limit:
+        out["breach"] = True
+        out["severity"] = "hard"
+        out["failure_cluster"] = "low_gain_loop"
+        out["requirements"]["change_command_family"] = True
+        out["requirements"]["require_explicit_success_signal"] = True
+        out["requirements"]["force_plan_refresh"] = True
+        out["requirements"]["force_branch_shift"] = True
+        out["timeout_cap_sec"] = 15 if expected_phase in {"probe", "exploit", "extract"} else 20
+        out["must_do"] = [
+            "Execution monitor triggered: force a replan before continuing execution.",
+            "Use a different command family and a narrow diagnostic command.",
+        ]
+        out["must_avoid"] = [f"Do not reuse command family `{family}` on the next step."]
+        out["allowed_families"] = derive_allowed_families_for_branch_shift(
+            blocked_family=family,
+            available_tools=available_action_names() + ["curl", "bash", "sqlmap", "nmap"],
+        )
+        out["rationale"] = (
+            f"Execution monitor same-family breach: streak={int(same_family_streak)} "
+            f"limit={safe_same_limit}, family={family}."
+        )
+        return out
+
+    if int(total_calls_since_replan) >= safe_total_limit:
+        out["breach"] = True
+        out["severity"] = "soft"
+        out["failure_cluster"] = "low_gain_loop"
+        out["requirements"]["require_explicit_success_signal"] = True
+        out["requirements"]["force_plan_refresh"] = True
+        out["timeout_cap_sec"] = 20 if expected_phase in {"recon", "probe"} else 15
+        out["must_do"] = [
+            "Execution monitor triggered: refresh plan and retire stale route assumptions.",
+            "Run one short verification command with explicit success criteria.",
+        ]
+        if family:
+            out["must_avoid"] = [f"Avoid immediate reuse of command family `{family}` after replan."]
+            out["allowed_families"] = derive_allowed_families_for_branch_shift(
+                blocked_family=family,
+                available_tools=available_action_names() + ["curl", "bash", "sqlmap", "nmap"],
+            )
+        out["rationale"] = (
+            f"Execution monitor total-call breach: calls_since_replan={int(total_calls_since_replan)} "
+            f"limit={safe_total_limit}."
+        )
+    return out
+
+
 def derive_gain_budget_policy(
     *,
     history: list[dict[str, Any]],
@@ -1845,6 +2018,7 @@ def derive_gain_budget_policy(
         "phase_override": "",
         "must_do": [],
         "must_avoid": [],
+        "allowed_families": [],
         "requirements": {
             "change_command_family": False,
             "require_explicit_success_signal": False,
@@ -1873,6 +2047,10 @@ def derive_gain_budget_policy(
             "Do not continue the same low-gain route after repeated weak steps.",
             "Do not spend another long timeout on the current strategy family.",
         ]
+        policy["allowed_families"] = derive_allowed_families_for_branch_shift(
+            blocked_family=last_family,
+            available_tools=available_action_names() + ["curl", "bash", "sqlmap", "nmap"],
+        )
         policy["rationale"] = (
             f"Hard low-gain budget breach: streak={low_gain_streak}, "
             f"recent_total={recent_total:.2f}, recent_avg={recent_avg:.2f}."
@@ -1896,6 +2074,10 @@ def derive_gain_budget_policy(
         ]
         if last_family:
             policy["must_avoid"].append(f"Do not reuse command family `{last_family}` on the next step.")
+            policy["allowed_families"] = derive_allowed_families_for_branch_shift(
+                blocked_family=last_family,
+                available_tools=available_action_names() + ["curl", "bash", "sqlmap", "nmap"],
+            )
         policy["rationale"] = (
             f"Soft low-gain budget breach: streak={low_gain_streak}, "
             f"same_family_streak={same_family_low_gain_streak}, recent_avg={recent_avg:.2f}."
@@ -1931,6 +2113,14 @@ def merge_controller_with_gain_policy(
 
     out["must_do"] = _dedupe(must_do)
     out["must_avoid"] = _dedupe(must_avoid)
+    current_allowed = [str(item).strip().lower() for item in out.get("allowed_families", []) if str(item).strip()]
+    incoming_allowed = [str(item).strip().lower() for item in gain_policy.get("allowed_families", []) if str(item).strip()]
+    if incoming_allowed:
+        out["allowed_families"] = _dedupe(incoming_allowed)
+    elif current_allowed:
+        out["allowed_families"] = _dedupe(current_allowed)
+    else:
+        out["allowed_families"] = []
 
     if gain_policy.get("breach"):
         out["failure_cluster"] = str(gain_policy.get("failure_cluster", "low_gain_loop")).strip().lower() or "low_gain_loop"
@@ -1950,6 +2140,7 @@ def soften_controller_for_codex(controller_reflection: dict[str, Any]) -> dict[s
         "failure_cluster": str(policy.get("failure_cluster", "none")).strip().lower() or "none",
         "must_do": [],
         "must_avoid": [],
+        "allowed_families": [str(item).strip().lower() for item in policy.get("allowed_families", []) if str(item).strip()],
         "rationale": str(policy.get("rationale", "")).strip(),
         "requirements": {
             "change_command_family": bool(requirements.get("change_command_family", False)),
@@ -2006,6 +2197,22 @@ def _rule_controller_recon_regression(
     return None
 
 
+def _rule_controller_allowed_families(
+    *,
+    allowed_families: list[str],
+    current_family: str,
+    **_: Any,
+) -> str | None:
+    allowed = [str(item).strip().lower() for item in allowed_families if str(item).strip()]
+    current = str(current_family).strip().lower()
+    if allowed and current and current not in allowed:
+        return (
+            "Controller requires a branch-shift family from the allowed set: "
+            f"current={current}, allowed={summarize_allowed_families(allowed)}"
+        )
+    return None
+
+
 def _rule_semantic_recovery_discovery_drift(
     *,
     cmd: str,
@@ -2048,6 +2255,7 @@ SEMANTIC_VALIDATION_RULES: tuple[ControllerRule, ...] = (
 CONTROLLER_VALIDATION_RULES: tuple[ControllerRule, ...] = (
     _rule_controller_change_command_family,
     _rule_controller_cluster_family_repeat,
+    _rule_controller_allowed_families,
     _rule_controller_recon_regression,
 )
 
@@ -2118,6 +2326,7 @@ def validate_action(
     if failure_cluster not in FAILURE_CLUSTERS:
         failure_cluster = "none"
     must_avoid = [str(item).strip() for item in policy.get("must_avoid", []) if str(item).strip()]
+    allowed_families = [str(item).strip().lower() for item in policy.get("allowed_families", []) if str(item).strip()]
     requirements = policy.get("requirements", {}) if isinstance(policy, dict) else {}
     require_change_family = bool(requirements.get("change_command_family", False))
     current_family = _command_family(command)
@@ -2128,6 +2337,7 @@ def validate_action(
         "phase": phase,
         "failure_cluster": failure_cluster,
         "must_avoid": must_avoid,
+        "allowed_families": allowed_families,
         "require_change_family": require_change_family,
         "current_family": current_family,
         "previous_family": previous_family,
@@ -2169,20 +2379,51 @@ def upsert_hypothesis(memory: MemoryStore, step: int, state: str, label: str, co
 
 def _command_family(command: str) -> str:
     lower = command.lower()
+    action_name = infer_action_name_from_command(command)
+    if action_name:
+        return f"python3:{action_name}"
     if "sqlmap" in lower:
         return "sqlmap"
     if "ffuf" in lower:
         return "ffuf"
+    if "wget" in lower:
+        return "wget"
     if "curl" in lower:
         return "curl"
     if "nmap" in lower:
         return "nmap"
+    if "bash -lc" in lower or lower.startswith("bash "):
+        if "curl " in lower:
+            return "bash:curl_flow"
+        return "bash"
+    if lower.startswith("python3 -m "):
+        try:
+            parts = shlex.split(command)
+            if len(parts) >= 3:
+                return f"python3:module:{parts[2]}"
+        except ValueError:
+            return "python3:module"
+        return "python3:module"
+    if lower.startswith("python3 "):
+        try:
+            parts = shlex.split(command)
+            if len(parts) >= 2:
+                script = Path(parts[1]).name
+                if script.endswith(".py"):
+                    return f"python3:{script[:-3]}"
+        except ValueError:
+            return "python3"
+        return "python3"
     if not command.strip():
         return "unknown"
     try:
         return shlex.split(command)[0]
     except ValueError:
         return command.strip().split()[0]
+
+
+def classify_command_family(command: str) -> str:
+    return _command_family(command)
 
 
 def reflect_step(
