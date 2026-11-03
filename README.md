@@ -56,6 +56,10 @@ mako/
   - includes NYU Web smoke rerun notes (`2026-04-11`) with intended-exploit verification and reliability-evaluation boundaries
 - `docs/codex.md`: research notes on moving this repo to a Codex-backed foundation via Responses API and function tools
 
+## SDK Compatibility Example
+
+[Claude Agent SDK compatibility demo](examples/claude_sdk_compat/README.md) checks fixed text and JSON responses with tools disabled. It runs against a local mock service by default; live gateway checks are opt-in. The example is independent of Mako's execution loop and does not establish GLM gateway compatibility until tested against that service.
+
 ## Current Sources
 
 - `PayloadsAllTheThings`: payload patterns and bypass tricks
