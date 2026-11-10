@@ -956,6 +956,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
             content_type=_content_type(path),
         )
 
+    def _static_asset(self, relpath: str) -> None:
+        path = (STATIC_DIR / relpath).resolve()
+        if not path.is_file() or not _is_within(path, STATIC_DIR):
+            self._send_error(HTTPStatus.NOT_FOUND, "not found")
+            return
+        content_type = {
+            ".js": "text/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".svg": "image/svg+xml",
+        }.get(path.suffix.lower())
+        if content_type is None:
+            self._send_error(HTTPStatus.NOT_FOUND, "not found")
+            return
+        self._send(
+            path.read_bytes(),
+            content_type=content_type,
+        )
+
     def do_HEAD(self) -> None:
         self.do_GET()
 
@@ -964,6 +982,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = parsed.path
         if path in {"/", "/index.html"}:
             self._static_file("index.html")
+            return
+        if path.startswith("/static/"):
+            self._static_asset(urllib.parse.unquote(path[len("/static/"):]))
             return
         if path == "/api/health":
             self._send_json({"ok": True, "generated_at": utc_now_z()})

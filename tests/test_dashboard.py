@@ -234,6 +234,27 @@ class DashboardServerTests(unittest.TestCase):
                 response = conn.getresponse()
                 response.read()
                 self.assertEqual(response.status, 404)
+
+                conn.request("GET", "/static/app.js")
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+                self.assertIn("javascript", response.getheader("Content-Type"))
+
+                conn.request("GET", "/static/vendor/vue.global.prod.js")
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+
+                conn.request("GET", "/static/../dashboard.py")
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 404)
+
+                conn.request("GET", "/static/vendor/licenses/vue.LICENSE")
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 404)
                 conn.close()
             finally:
                 server.shutdown()

@@ -6,1828 +6,595 @@
   <title>Mako Agent Dashboard</title>
   <style>
     :root {
-      color-scheme: dark;
-      --bg: #080d1b;
-      --bg-soft: #0f172b;
-      --panel: rgba(16, 24, 43, 0.92);
-      --panel-strong: rgba(22, 32, 58, 0.96);
-      --border: rgba(148, 163, 184, 0.18);
-      --border-strong: rgba(148, 163, 184, 0.34);
-      --text: #e5edf9;
-      --muted: #8fa0bc;
-      --accent: #67e8f9;
-      --accent-2: #a78bfa;
-      --good: #34d399;
-      --bad: #fb7185;
-      --warn: #fbbf24;
-      --origin: #2dd4bf;
-      --goal: #fb7185;
-      --shadow: 0 18px 55px rgba(0, 0, 0, 0.34);
-      --radius: 18px;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
-        "Segoe UI", sans-serif;
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --border: #e2e8f0;
+      --border-soft: rgba(226, 232, 240, 0.6);
+      --text: #334155;
+      --strong: #1e293b;
+      --muted: #94a3b8;
+      --muted-2: #64748b;
+      --brand: #6366f1;
+      --brand-hover: #4f46e5;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
 
     * { box-sizing: border-box; }
-    [hidden] { display: none !important; }
+    [v-cloak] { display: none !important; }
     html, body { height: 100%; }
     body {
       margin: 0;
       color: var(--text);
+      background: var(--bg);
       overflow: hidden;
-      background:
-        radial-gradient(circle at 10% 0%, rgba(103, 232, 249, 0.13), transparent 34rem),
-        radial-gradient(circle at 90% 10%, rgba(167, 139, 250, 0.13), transparent 30rem),
-        var(--bg);
+      font-family: -apple-system, BlinkMacSystemFont, Inter, "Segoe UI", sans-serif;
+      font-size: 13px;
     }
+    h1, h2, h3, h4, p { margin: 0; }
+    button { font: inherit; color: inherit; }
+    .mono { font-family: var(--mono); }
 
-    button, input, select { font: inherit; }
-    button { color: inherit; }
-    h1, h2, h3, p { margin: 0; }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 999px; }
+    * { scrollbar-width: thin; scrollbar-color: #cbd5e1 transparent; }
 
-    .shell {
-      width: min(1880px, calc(100vw - 24px));
-      height: calc(100vh - 24px);
-      margin: 0 auto;
-      padding: 12px 0;
-      display: flex;
-      flex-direction: column;
-      gap: 12px;
-      min-height: 560px;
-    }
+    #app { height: 100vh; display: flex; flex-direction: column; }
+    .view { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
 
     .topbar {
       display: flex;
       align-items: center;
-      justify-content: space-between;
-      gap: 18px;
-      min-height: 54px;
+      gap: 12px;
+      padding: 10px 16px;
+      background: rgba(255, 255, 255, 0.8);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid var(--border-soft);
       flex: 0 0 auto;
     }
-
-    .brand { display: flex; align-items: center; gap: 12px; min-width: 0; }
+    .spacer { flex: 1; }
+    .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
     .mark {
-      display: grid;
-      place-items: center;
-      width: 40px;
-      height: 40px;
-      border-radius: 13px;
-      color: #06111f;
-      font-weight: 900;
-      letter-spacing: -0.08em;
-      background: linear-gradient(135deg, var(--accent), var(--accent-2));
-      box-shadow: 0 0 34px rgba(103, 232, 249, 0.22);
-      flex: 0 0 auto;
-    }
-    h1 { font-size: 21px; letter-spacing: -0.03em; }
-    .subtitle {
-      color: var(--muted);
-      font-size: 12px;
-      margin-top: 3px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }
-    .top-actions { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
-    .live-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--good); box-shadow: 0 0 16px var(--good); }
-
-    .button {
-      border: 1px solid var(--border);
-      color: var(--text);
-      background: rgba(255, 255, 255, 0.045);
-      border-radius: 999px;
-      padding: 8px 12px;
-      cursor: pointer;
-      font-size: 12px;
-      font-weight: 700;
-      transition: border-color 160ms ease, transform 160ms ease, background 160ms ease;
-      white-space: nowrap;
-    }
-    .button:hover:not(:disabled) { border-color: var(--accent); transform: translateY(-1px); }
-    .button:disabled { opacity: 0.38; cursor: not-allowed; }
-    .button.active { border-color: rgba(103, 232, 249, 0.56); background: rgba(103, 232, 249, 0.1); color: var(--accent); }
-
-    .metrics {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(0, 1fr));
-      gap: 10px;
-      flex: 0 0 auto;
-    }
-    .metric, .panel {
+      width: 32px;
+      height: 32px;
+      border-radius: 8px;
       border: 1px solid var(--border);
       background: var(--panel);
-      box-shadow: var(--shadow);
-      backdrop-filter: blur(18px);
-    }
-    .metric { border-radius: 15px; padding: 12px 13px; min-height: 76px; min-width: 0; }
-    .metric .label { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; }
-    .metric .value { font-size: 23px; font-weight: 800; letter-spacing: -0.04em; margin-top: 5px; }
-    .metric .note { color: var(--muted); font-size: 11px; margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-    .workspace {
-      flex: 1 1 auto;
-      min-height: 0;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05);
       display: grid;
-      grid-template-columns: 310px minmax(430px, 1fr) 380px;
-      gap: 12px;
-    }
-
-    .panel { border-radius: var(--radius); overflow: hidden; min-height: 0; }
-    .panel-header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      padding: 12px 14px;
-      border-bottom: 1px solid var(--border);
-      background: rgba(255, 255, 255, 0.025);
+      place-items: center;
+      color: var(--brand);
+      font-size: 14px;
+      font-weight: 700;
       flex: 0 0 auto;
     }
-    .panel-header h2 { font-size: 14px; letter-spacing: -0.01em; }
-    .panel-header .meta { color: var(--muted); font-size: 11px; }
+    .brand-name { font-size: 14px; font-weight: 600; color: var(--text); letter-spacing: -0.02em; }
 
-    .sidebar { display: flex; flex-direction: column; }
-    .filters {
-      display: grid;
-      grid-template-columns: 1fr 112px;
-      gap: 8px;
-      padding: 10px;
-      border-bottom: 1px solid var(--border);
-      flex: 0 0 auto;
-    }
-    .filters input, .filters select, .graph-toolbar select, .replay-controls select {
-      width: 100%;
-      border: 1px solid var(--border);
-      border-radius: 11px;
-      color: var(--text);
-      background: rgba(5, 10, 24, 0.72);
-      outline: none;
-      padding: 8px 9px;
-      font-size: 12px;
-    }
-    .filters input:focus, .filters select:focus { border-color: var(--accent); }
-    .run-list { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 9px; }
-    .run-item {
-      display: block;
-      width: 100%;
-      border: 1px solid transparent;
-      border-radius: 14px;
-      color: inherit;
-      background: transparent;
-      text-align: left;
-      padding: 11px;
+    .topbar-stats { display: flex; align-items: center; gap: 12px; font-size: 11px; color: var(--muted); }
+    .stat { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+    .stat-label { text-transform: uppercase; letter-spacing: 0.12em; color: var(--muted); font-weight: 500; }
+    .stat-num { font-weight: 600; color: var(--muted-2); font-variant-numeric: tabular-nums; }
+    .dot { width: 6px; height: 6px; border-radius: 999px; display: inline-block; }
+    .dot.teal { background: #14b8a6; }
+    .dot.rose { background: #f43f5e; }
+    .dot.amber { background: #f59e0b; }
+    .stat-num.teal { color: #0f766e; }
+    .stat-num.rose { color: #e11d48; }
+    .stat-num.amber { color: #b45309; }
+
+    .icon-btn {
+      padding: 6px;
+      border-radius: 8px;
+      border: 0;
+      background: none;
+      color: var(--muted);
       cursor: pointer;
-      transition: background 140ms ease, border-color 140ms ease;
-    }
-    .run-item:hover { background: rgba(255, 255, 255, 0.04); }
-    .run-item.active { border-color: rgba(103, 232, 249, 0.52); background: rgba(103, 232, 249, 0.08); }
-    .run-id {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 9px;
-      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-      font-size: 11px;
-      color: #c9d7ef;
-    }
-    .run-objective {
-      margin-top: 7px;
-      font-size: 13px;
-      line-height: 1.34;
-      display: -webkit-box;
-      -webkit-box-orient: vertical;
-      -webkit-line-clamp: 2;
-      overflow: hidden;
-    }
-    .run-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; color: var(--muted); font-size: 10px; }
-
-    .pill {
-      display: inline-flex;
-      align-items: center;
-      gap: 5px;
-      border-radius: 999px;
-      padding: 3px 8px;
-      border: 1px solid var(--border);
-      background: rgba(255, 255, 255, 0.04);
-      color: #cbd5e1;
-      font-size: 10px;
-      font-weight: 800;
-      white-space: nowrap;
-    }
-    .pill::before { content: ""; width: 6px; height: 6px; border-radius: 999px; background: var(--muted); }
-    .pill.completed, .pill.success { color: var(--good); border-color: rgba(52, 211, 153, 0.36); }
-    .pill.completed::before, .pill.success::before { background: var(--good); }
-    .pill.failed, .pill.error { color: var(--bad); border-color: rgba(251, 113, 133, 0.36); }
-    .pill.failed::before, .pill.error::before { background: var(--bad); }
-    .pill.running, .pill.accepted, .pill.applied { color: var(--warn); border-color: rgba(251, 191, 36, 0.36); }
-    .pill.running::before, .pill.accepted::before, .pill.applied::before { background: var(--warn); }
-    .pill.origin { color: var(--origin); border-color: rgba(45, 212, 191, 0.38); }
-    .pill.origin::before { background: var(--origin); }
-    .pill.goal { color: var(--goal); border-color: rgba(251, 113, 133, 0.38); }
-    .pill.goal::before { background: var(--goal); }
-
-    .graph-panel { display: flex; flex-direction: column; position: relative; }
-    .graph-toolbar {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      padding: 9px 10px;
-      border-bottom: 1px solid var(--border);
-      flex: 0 0 auto;
-      overflow-x: auto;
-    }
-    .graph-toolbar .spacer { flex: 1 1 auto; }
-    .graph-toolbar select { width: auto; min-width: 82px; }
-    .icon-button {
       display: inline-grid;
       place-items: center;
-      width: 30px;
-      height: 30px;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: rgba(255, 255, 255, 0.045);
-      cursor: pointer;
-      color: var(--muted);
-      font-weight: 800;
+      flex: 0 0 auto;
     }
-    .icon-button:hover { color: var(--text); border-color: var(--accent); }
-    .replay-controls {
-      display: flex;
+    .icon-btn:hover { background: #f1f5f9; color: #475569; }
+
+    .btn {
+      height: 28px;
+      padding: 0 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      font-weight: 500;
+      border: 1px solid;
+      cursor: pointer;
+      display: inline-flex;
       align-items: center;
       gap: 6px;
-      border: 1px solid rgba(167, 139, 250, 0.3);
+      white-space: nowrap;
+      transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+      background: var(--panel);
+      flex: 0 0 auto;
+    }
+    .btn.slate { border-color: var(--border); color: var(--muted-2); }
+    .btn.slate:hover { background: #f8fafc; color: var(--text); }
+    .btn.violet { border-color: #ddd6fe; color: #7c3aed; }
+    .btn.violet:hover { background: #f5f3ff; }
+    .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    .sel {
+      height: 28px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      color: var(--muted-2);
+      padding: 0 8px;
+      font-size: 12px;
+      outline: none;
+    }
+    .sel:focus { border-color: #c7d2fe; box-shadow: 0 0 0 2px #e0e7ff; }
+
+    .replay-group {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border: 1px solid #ddd6fe;
+      background: rgba(245, 243, 255, 0.8);
+      border-radius: 12px;
+      padding: 4px 8px;
+      font-size: 12px;
+      color: #6d28d9;
+      flex: 0 0 auto;
+    }
+    .replay-progress { font-weight: 500; white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .rbtn {
+      height: 24px;
+      min-width: 24px;
+      padding: 0 6px;
+      border: 1px solid #ddd6fe;
+      background: rgba(255, 255, 255, 0.8);
+      border-radius: 6px;
+      color: #6d28d9;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .rbtn:hover { background: #fff; }
+    .rsel {
+      height: 24px;
+      border: 1px solid #ddd6fe;
+      background: rgba(255, 255, 255, 0.8);
+      border-radius: 6px;
+      font-size: 11px;
+      color: #6d28d9;
+      padding: 0 6px;
+      outline: none;
+    }
+
+    .status-badge {
+      padding: 2px 6px;
       border-radius: 999px;
-      padding: 3px;
-      background: rgba(167, 139, 250, 0.08);
+      font-size: 9px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      white-space: nowrap;
+      background: #f1f5f9;
+      color: var(--muted-2);
+      flex: 0 0 auto;
     }
-    .replay-controls select { width: 72px; border-radius: 999px; padding: 5px 7px; }
-    .replay-label { color: #d8b4fe; font-size: 11px; font-weight: 800; padding: 0 5px; white-space: nowrap; }
+    .status-badge.completed, .status-badge.success { background: #ecfdf5; color: #047857; }
+    .status-badge.failed, .status-badge.error { background: #fff1f2; color: #e11d48; }
+    .status-badge.running, .status-badge.accepted, .status-badge.applied { background: #fffbeb; color: #b45309; }
 
-    .graph-canvas {
-      position: relative;
-      flex: 1 1 auto;
-      min-height: 0;
-      overflow: hidden;
-      cursor: grab;
-      background:
-        linear-gradient(rgba(148, 163, 184, 0.055) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(148, 163, 184, 0.055) 1px, transparent 1px),
-        radial-gradient(circle at 18% 20%, rgba(103, 232, 249, 0.05), transparent 22rem),
-        radial-gradient(circle at 86% 12%, rgba(167, 139, 250, 0.055), transparent 24rem),
-        rgba(2, 6, 23, 0.24);
-      background-size: 36px 36px, 36px 36px, auto, auto, auto;
-      touch-action: none;
-    }
-    .graph-canvas.dragging { cursor: grabbing; }
-    .graph-world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
-    .edge-svg { position: absolute; left: 0; top: 0; overflow: visible; }
-    .graph-edge-hit { fill: none; stroke: transparent; stroke-width: 18; cursor: pointer; }
-    .graph-edge {
-      fill: none;
-      stroke: rgba(148, 163, 184, 0.52);
-      stroke-width: 2;
-      marker-end: url(#arrowMuted);
-      transition: opacity 160ms ease, stroke 160ms ease, stroke-width 160ms ease;
-      pointer-events: none;
-    }
-    .graph-edge.kind-origin { stroke: rgba(45, 212, 191, 0.58); }
-    .graph-edge.kind-lineage { stroke: rgba(103, 232, 249, 0.55); }
-    .graph-edge.kind-intervention { stroke: rgba(251, 191, 36, 0.68); stroke-dasharray: 7 5; }
-    .graph-edge.kind-call { stroke: rgba(103, 232, 249, 0.45); }
-    .graph-edge.kind-session, .graph-edge.kind-session_lineage { stroke: rgba(167, 139, 250, 0.58); stroke-dasharray: 4 4; }
-    .graph-edge.kind-evidence { stroke: rgba(148, 163, 184, 0.38); stroke-dasharray: 3 4; }
-    .graph-edge.kind-outcome { stroke: rgba(52, 211, 153, 0.62); }
-    .graph-edge.related { stroke-width: 3.4; filter: drop-shadow(0 0 7px rgba(103, 232, 249, 0.34)); }
-    .graph-edge.dim { opacity: 0.12; }
-    .edge-label {
-      fill: #aab8d2;
-      font-size: 10px;
-      paint-order: stroke;
-      stroke: rgba(2, 6, 23, 0.88);
-      stroke-width: 4px;
-      stroke-linejoin: round;
-      pointer-events: none;
-    }
-    .edge-label.dim { opacity: 0.12; }
+    .list-scroll { flex: 1; overflow-y: auto; padding: 16px; }
+    .empty-state { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; color: var(--muted); }
+    .empty-title { font-size: 18px; font-weight: 500; color: var(--muted-2); }
+    .empty-sub { font-size: 14px; color: var(--muted); margin-top: 4px; }
 
-    .graph-node {
-      position: absolute;
+    .card-grid { display: grid; grid-template-columns: repeat(1, minmax(0, 1fr)); gap: 12px; }
+    @media (min-width: 640px) { .card-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (min-width: 1024px) { .card-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+    @media (min-width: 1280px) { .card-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
+
+    .run-card {
       display: flex;
       flex-direction: column;
-      justify-content: center;
-      gap: 4px;
-      border: 1px solid var(--border-strong);
-      border-radius: 15px;
-      padding: 10px 12px;
-      background: linear-gradient(180deg, rgba(23, 33, 59, 0.96), rgba(13, 20, 38, 0.96));
-      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.28);
+      background: var(--panel);
+      border-radius: 16px;
+      border: 1px solid var(--border-soft);
+      padding: 20px;
       cursor: pointer;
-      min-width: 0;
-      transition: opacity 160ms ease, border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
-      user-select: none;
+      transition: box-shadow 200ms ease, transform 200ms ease, border-color 200ms ease;
     }
-    .graph-node:hover { border-color: var(--accent); transform: translateY(-1px); }
-    .graph-node .node-type {
-      color: var(--muted);
-      font-size: 9px;
-      font-weight: 900;
-      letter-spacing: 0.12em;
-      text-transform: uppercase;
-    }
-    .graph-node .node-label {
-      color: var(--text);
-      font-size: 12px;
-      font-weight: 800;
-      line-height: 1.22;
-      overflow: hidden;
+    .run-card:hover { box-shadow: 0 10px 24px rgba(15, 23, 42, 0.08); transform: translateY(-2px); border-color: #cbd5e1; }
+    .card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 12px; }
+    .run-id { font-family: var(--mono); font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .card-title { font-size: 15px; font-weight: 600; color: var(--text); overflow-wrap: anywhere; line-height: 1.3; }
+    .card-objective {
+      margin-top: 6px;
+      font-size: 13px;
+      color: var(--muted-2);
+      line-height: 1.4;
       display: -webkit-box;
       -webkit-box-orient: vertical;
       -webkit-line-clamp: 2;
-      overflow-wrap: anywhere;
-    }
-    .graph-node .node-subtitle {
-      color: var(--muted);
-      font-size: 10px;
-      line-height: 1.25;
       overflow: hidden;
-      display: -webkit-box;
-      -webkit-box-orient: vertical;
-      -webkit-line-clamp: 2;
-      overflow-wrap: anywhere;
+      flex: 1;
     }
-    .graph-node.type-origin { border-color: rgba(45, 212, 191, 0.55); background: linear-gradient(180deg, rgba(14, 116, 106, 0.62), rgba(8, 48, 46, 0.94)); }
-    .graph-node.type-goal { border-color: rgba(251, 113, 133, 0.56); background: linear-gradient(180deg, rgba(116, 27, 48, 0.62), rgba(51, 14, 28, 0.94)); }
-    .graph-node.type-run { border-color: rgba(103, 232, 249, 0.36); }
-    .graph-node.type-call { border-color: rgba(96, 165, 250, 0.4); }
-    .graph-node.type-session { border-color: rgba(167, 139, 250, 0.45); }
-    .graph-node.type-evidence { border-style: dashed; border-color: rgba(148, 163, 184, 0.38); background: rgba(15, 23, 42, 0.86); }
-    .graph-node.status-completed, .graph-node.status-success { border-color: rgba(52, 211, 153, 0.55); }
-    .graph-node.status-failed, .graph-node.status-error { border-color: rgba(251, 113, 133, 0.62); }
-    .graph-node.status-running, .graph-node.status-accepted, .graph-node.status-applied { border-color: rgba(251, 191, 36, 0.62); box-shadow: 0 0 24px rgba(251, 191, 36, 0.11); }
-    .graph-node.selected { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(103, 232, 249, 0.13), 0 16px 34px rgba(0, 0, 0, 0.32); }
-    .graph-node.related { border-color: rgba(103, 232, 249, 0.55); }
-    .graph-node.dim { opacity: 0.18; }
-    .graph-node.event-focus { animation: nodePulse 1.1s ease-in-out infinite alternate; }
-    @keyframes nodePulse {
-      from { box-shadow: 0 0 0 2px rgba(103, 232, 249, 0.16), 0 12px 28px rgba(0,0,0,.28); }
-      to { box-shadow: 0 0 0 8px rgba(103, 232, 249, 0.08), 0 12px 28px rgba(0,0,0,.28); }
-    }
+    .card-meta { margin-top: 12px; padding-top: 12px; font-size: 11px; color: var(--muted); border-top: 1px solid #f1f5f9; display: flex; flex-wrap: wrap; gap: 2px 10px; font-variant-numeric: tabular-nums; }
+    .card-meta .followup { width: 100%; }
 
-    .graph-empty { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); text-align: center; padding: 24px; }
-    .graph-empty[hidden] { display: none; }
-    .graph-legend {
-      position: absolute;
-      left: 12px;
-      bottom: 12px;
+    .run-body { flex: 1; display: flex; overflow: hidden; min-height: 0; }
+    .graph-wrap { flex: 1; position: relative; min-width: 0; background: var(--bg); }
+    .graph-controls { position: absolute; top: 12px; left: 12px; z-index: 10; display: flex; align-items: center; gap: 6px; }
+    .ctl {
+      height: 28px;
+      background: rgba(255, 255, 255, 0.9);
+      backdrop-filter: blur(8px);
+      border-radius: 8px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+      border: 1px solid var(--border-soft);
+      color: var(--muted-2);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+    }
+    .ctl:hover { background: #fff; color: var(--text); }
+    .ctl.btn-icon { width: 28px; }
+    select.ctl { padding: 0 10px; font-size: 12px; appearance: auto; }
+    .cy { position: absolute; inset: 0; }
+
+    .side {
+      width: 360px;
+      flex: 0 0 360px;
+      border-left: 1px solid var(--border-soft);
+      background: var(--panel);
       display: flex;
-      flex-wrap: wrap;
-      gap: 7px;
-      max-width: calc(100% - 24px);
-      pointer-events: none;
+      flex-direction: column;
+      overflow: hidden;
     }
-    .legend-chip {
-      border: 1px solid var(--border);
-      border-radius: 999px;
-      background: rgba(8, 13, 27, 0.76);
-      backdrop-filter: blur(12px);
-      color: var(--muted);
-      padding: 5px 8px;
-      font-size: 10px;
-      font-weight: 800;
-    }
-    .legend-chip i { display: inline-block; width: 7px; height: 7px; border-radius: 999px; margin-right: 5px; }
-
-    .inspector { display: flex; flex-direction: column; }
-    .tabs { display: flex; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+    .tabs { display: flex; border-bottom: 1px solid #f1f5f9; flex: 0 0 auto; }
     .tab {
       flex: 1;
+      padding: 10px 12px;
+      font-size: 12px;
+      font-weight: 500;
+      background: none;
       border: 0;
       border-bottom: 2px solid transparent;
-      background: transparent;
       color: var(--muted);
-      padding: 10px 8px;
       cursor: pointer;
-      font-size: 12px;
-      font-weight: 800;
     }
-    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-    .inspector-body { flex: 1 1 auto; min-height: 0; overflow: auto; padding: 14px; }
-    .detail-title { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
-    .detail-title h2 { font-size: 16px; overflow-wrap: anywhere; }
-    .detail-subtitle { color: var(--muted); font-size: 12px; margin-top: 5px; overflow-wrap: anywhere; }
-    .field-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin: 12px 0 15px; }
-    .field {
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      padding: 9px;
-      background: rgba(255, 255, 255, 0.025);
-      min-width: 0;
-    }
-    .field .name { color: var(--muted); font-size: 9px; text-transform: uppercase; letter-spacing: 0.07em; }
-    .field .value { margin-top: 5px; font-size: 12px; overflow-wrap: anywhere; }
-    .subsection { margin-top: 15px; }
-    .subsection h3 { color: #cbd5e1; font-size: 11px; margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.07em; }
+    .tab:hover { color: var(--muted-2); }
+    .tab.active { color: var(--brand); border-bottom-color: var(--brand); }
+    .tab .cnt { font-size: 10px; opacity: 0.6; margin-left: 2px; font-variant-numeric: tabular-nums; }
+    .tab-body { flex: 1; overflow-y: auto; padding: 16px; background: rgba(248, 250, 252, 0.4); min-height: 0; }
 
-    table { width: 100%; border-collapse: collapse; border: 1px solid var(--border); border-radius: 12px; overflow: hidden; font-size: 11px; }
-    th, td { border-bottom: 1px solid var(--border); padding: 7px 8px; text-align: left; vertical-align: top; }
-    th { color: var(--muted); background: rgba(255, 255, 255, 0.025); font-weight: 800; }
-    tr:last-child td { border-bottom: 0; }
-    td.mono, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
-    .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-    .chip { border: 1px solid var(--border); border-radius: 999px; color: #cbd5e1; background: rgba(255,255,255,.035); padding: 5px 7px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; }
-    .record {
-      max-height: 320px;
-      overflow: auto;
-      border: 1px solid var(--border);
+    .kv-list { display: flex; flex-direction: column; }
+    .kv { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 5px 0; font-size: 12px; }
+    .kv .k { color: var(--muted); flex: 0 0 auto; }
+    .kv .v { color: var(--muted-2); text-align: right; overflow-wrap: anywhere; min-width: 0; font-variant-numeric: tabular-nums; }
+    .kv .v.mono { font-size: 10.5px; }
+    .sec { font-size: 10px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin: 18px 0 8px; }
+    .report {
+      font-family: var(--mono);
+      font-size: 12px;
+      background: #f8fafc;
+      border: 1px solid #f1f5f9;
       border-radius: 12px;
-      background: rgba(2, 6, 23, 0.72);
-      color: #d8e2f3;
-      padding: 11px;
+      padding: 12px;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
-      font-size: 11px;
-      line-height: 1.5;
+      max-height: 420px;
+      overflow: auto;
+      color: var(--text);
+      line-height: 1.55;
+      margin: 0;
     }
-    .empty { color: var(--muted); padding: 18px; text-align: center; border: 1px dashed var(--border); border-radius: 14px; font-size: 12px; }
-    .link-button {
-      border: 0;
-      background: transparent;
-      color: var(--accent);
-      padding: 0;
-      cursor: pointer;
-      font: inherit;
-      text-align: left;
-      overflow-wrap: anywhere;
-    }
-    .link-button:hover { text-decoration: underline; }
+    .hint { text-align: center; color: #cbd5e1; font-size: 12px; margin-top: 28px; }
+    .link { border: 0; background: none; color: var(--brand); font-size: 12px; cursor: pointer; padding: 0; margin-top: 12px; display: inline-block; }
+    .link:hover { color: var(--brand-hover); text-decoration: underline; }
 
-    .event-list { display: flex; flex-direction: column; gap: 0; }
-    .event-item {
-      position: relative;
+    .node-card { border: 1px solid var(--border); border-radius: 16px; background: var(--panel); overflow: hidden; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.05); }
+    .nc-head { padding: 10px 14px; border-bottom: 1px solid #f1f5f9; background: rgba(248, 250, 252, 0.8); display: flex; align-items: center; gap: 8px; min-width: 0; }
+    .nc-chip { padding: 2px 8px; border-radius: 6px; font-size: 10px; font-weight: 700; color: #fff; flex: 0 0 auto; }
+    .nc-id { font-family: var(--mono); font-size: 10px; color: var(--muted); overflow-wrap: anywhere; min-width: 0; }
+    .nc-body { padding: 14px; }
+    .nc-label { font-size: 13px; color: var(--text); line-height: 1.45; overflow-wrap: anywhere; margin-bottom: 10px; }
+
+    .ev-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; padding: 9px 0; border-bottom: 1px solid #f1f5f9; }
+    .ev-row:last-child { border-bottom: 0; }
+    .ev-main { min-width: 0; }
+    .ev-title { font-size: 12px; color: var(--text); }
+    .ev-ref { font-family: var(--mono); font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: block; margin-top: 2px; }
+    .ev-side { font-size: 11px; color: var(--muted); text-align: right; white-space: nowrap; flex: 0 0 auto; font-variant-numeric: tabular-nums; }
+    .ev-side .mono { font-size: 10.5px; }
+
+    .log-row {
       display: grid;
-      grid-template-columns: 18px minmax(0, 1fr);
-      gap: 9px;
+      grid-template-columns: 52px 12px minmax(0, 1fr);
+      column-gap: 8px;
       width: 100%;
-      border: 0;
-      background: transparent;
-      color: inherit;
       text-align: left;
-      padding: 9px 4px 10px;
+      background: none;
+      border: 0;
+      padding: 7px 6px;
       cursor: pointer;
+      border-radius: 8px;
+      color: inherit;
     }
-    .event-item::before {
-      content: "";
-      position: absolute;
-      left: 8px;
-      top: 27px;
-      bottom: -4px;
-      border-left: 1px solid var(--border);
-    }
-    .event-item:last-child::before { display: none; }
-    .event-dot { width: 9px; height: 9px; border-radius: 999px; margin: 5px 0 0 4px; background: var(--muted); box-shadow: 0 0 0 4px rgba(148,163,184,.08); }
-    .event-item.type-call_started .event-dot, .event-item.type-call_finished .event-dot { background: var(--accent); }
-    .event-item.type-evidence_captured .event-dot { background: #94a3b8; }
-    .event-item.type-run_registered .event-dot, .event-item.type-run_status .event-dot { background: var(--good); }
-    .event-item.type-intervention_resume .event-dot, .event-item.type-intervention_inspect .event-dot, .event-item.type-intervention_fork .event-dot { background: var(--warn); }
-    .event-title { font-size: 12px; font-weight: 750; overflow-wrap: anywhere; }
-    .event-meta { color: var(--muted); font-size: 10px; margin-top: 4px; overflow-wrap: anywhere; }
-    .event-time { color: var(--muted); font-size: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; margin-top: 5px; }
-    .event-item:hover { background: rgba(255,255,255,.03); }
-    .event-item.active { background: rgba(103, 232, 249, 0.075); border-radius: 10px; }
-    .event-item.future { opacity: 0.35; cursor: default; }
+    .log-row:hover { background: #f1f5f9; }
+    .log-row.active { background: #eef2ff; }
+    .log-row.future { opacity: 0.35; }
+    .log-time { font-family: var(--mono); font-size: 11px; color: var(--muted); margin-top: 1px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+    .log-dot { width: 8px; height: 8px; border-radius: 999px; margin-top: 4px; background: #cbd5e1; }
+    .log-row.dot-call_started .log-dot, .log-row.dot-call_finished .log-dot { background: #818cf8; }
+    .log-row.dot-evidence_captured .log-dot { background: #94a3b8; }
+    .log-row.dot-run_registered .log-dot, .log-row.dot-run_status .log-dot { background: #34d399; }
+    .log-row.dot-intervention_resume .log-dot, .log-row.dot-intervention_inspect .log-dot,
+    .log-row.dot-intervention_fork .log-dot { background: #fbbf24; }
+    .log-main { min-width: 0; }
+    .log-title { font-size: 12px; color: var(--text); display: block; overflow-wrap: anywhere; }
+    .log-meta { font-size: 11px; color: var(--muted); display: block; margin-top: 2px; overflow-wrap: anywhere; }
 
-    .error-banner {
-      display: none;
-      border: 1px solid rgba(251, 113, 133, 0.42);
-      border-radius: 14px;
-      color: #fecdd3;
-      background: rgba(127, 29, 29, 0.26);
-      padding: 10px 12px;
-      flex: 0 0 auto;
-      font-size: 12px;
-    }
-    .error-banner.visible { display: block; }
-
-    .modal {
+    .overlay {
       position: fixed;
       inset: 0;
       z-index: 50;
-      display: none;
+      background: rgba(15, 23, 42, 0.25);
+      backdrop-filter: blur(6px);
+      display: flex;
       align-items: center;
       justify-content: center;
       padding: 22px;
-      background: rgba(2, 6, 23, 0.58);
-      backdrop-filter: blur(8px);
     }
-    .modal.visible { display: flex; }
-    .modal-card {
-      width: min(980px, 100%);
+    .modal {
+      background: var(--panel);
+      border-radius: 16px;
+      border: 1px solid var(--border-soft);
+      box-shadow: 0 25px 50px rgba(15, 23, 42, 0.25);
+      width: min(920px, 100%);
       max-height: 82vh;
       display: flex;
       flex-direction: column;
-      border: 1px solid var(--border-strong);
-      border-radius: 18px;
-      background: var(--panel-strong);
-      box-shadow: var(--shadow);
       overflow: hidden;
     }
-    .modal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 15px; border-bottom: 1px solid var(--border); }
-    .modal-body { min-height: 0; overflow: auto; padding: 14px; }
-    .modal-body pre {
-      margin: 0;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      color: #d8e2f3;
-      font-size: 11px;
-      line-height: 1.55;
-    }
+    .modal-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 16px; border-bottom: 1px solid #f1f5f9; }
+    .modal-head h3 { font-size: 14px; font-weight: 600; color: var(--text); }
+    .modal-head .sub { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    .modal-actions { display: flex; align-items: center; gap: 8px; }
+    .modal-body { flex: 1; overflow: auto; padding: 14px; min-height: 0; }
+    .modal-body pre { margin: 0; font-family: var(--mono); font-size: 11.5px; color: var(--text); line-height: 1.55; white-space: pre-wrap; overflow-wrap: anywhere; }
 
-    @media (max-width: 1280px) {
-      body { overflow: auto; }
-      .shell { height: auto; min-height: 100vh; }
-      .workspace { grid-template-columns: 280px minmax(0, 1fr); }
-      .inspector { grid-column: 1 / -1; min-height: 560px; }
-      .graph-canvas { min-height: 560px; }
-    }
-    @media (max-width: 860px) {
-      .topbar { align-items: flex-start; flex-direction: column; }
-      .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .workspace { grid-template-columns: 1fr; }
-      .sidebar, .inspector { min-height: 420px; }
-      .graph-canvas { min-height: 520px; }
+    .error-banner {
+      position: fixed;
+      top: 10px;
+      left: 50%;
+      transform: translateX(-50%);
+      z-index: 40;
+      background: #fff1f2;
+      color: #e11d48;
+      border: 1px solid #fecdd3;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font-size: 12px;
+      box-shadow: 0 4px 12px rgba(15, 23, 42, 0.08);
+      max-width: 70vw;
     }
   </style>
 </head>
 <body>
-  <div class="shell">
-    <header class="topbar">
-      <div class="brand">
-        <div class="mark">M</div>
-        <div>
-          <h1>Mako Agent Dashboard</h1>
-          <p class="subtitle">Cairn-style provenance canvas for runs, sessions, calls, follow-ups, and captured evidence.</p>
+  <div id="app" v-cloak>
+    <div v-if="view === 'list'" class="view">
+      <header class="topbar">
+        <div class="brand">
+          <div class="mark">M</div>
+          <span class="brand-name">Mako</span>
         </div>
-      </div>
-      <div class="top-actions">
-        <span id="updatedAt">Waiting for data</span>
-        <span class="live-dot" aria-hidden="true"></span>
-        <button class="button" id="refreshButton" type="button">Refresh</button>
-      </div>
-    </header>
-
-    <div class="error-banner" id="errorBanner"></div>
-    <section class="metrics" id="metrics"></section>
-
-    <main class="workspace">
-      <aside class="panel sidebar">
-        <div class="panel-header">
-          <h2>Runs</h2>
-          <span class="meta" id="runCount">0</span>
+        <div class="spacer"></div>
+        <div class="topbar-stats">
+          <span class="stat" title="All runs">
+            <span class="stat-label">All</span>
+            <span class="stat-num">{{ runs.length }}</span>
+          </span>
+          <span v-if="statusCount('completed')" class="stat" title="Completed runs">
+            <i class="dot teal"></i>
+            <span class="stat-num teal">{{ statusCount('completed') }}</span>
+          </span>
+          <span v-if="statusCount('failed')" class="stat" title="Failed runs">
+            <i class="dot rose"></i>
+            <span class="stat-num rose">{{ statusCount('failed') }}</span>
+          </span>
+          <span v-if="statusCount('running')" class="stat" title="Running runs">
+            <i class="dot amber"></i>
+            <span class="stat-num amber">{{ statusCount('running') }}</span>
+          </span>
+          <span class="stat-num">{{ fmtCost(totalCost) }}</span>
         </div>
-        <div class="filters">
-          <input id="searchInput" type="search" placeholder="Filter run, target, objective…" autocomplete="off">
-          <select id="statusFilter" aria-label="Status filter">
-            <option value="all">All statuses</option>
-            <option value="completed">Completed</option>
-            <option value="failed">Failed</option>
-            <option value="running">Running</option>
-          </select>
+      </header>
+      <div class="list-scroll">
+        <div v-if="!runs.length" class="empty-state">
+          <p class="empty-title">No runs yet</p>
+          <p class="empty-sub">Run ./scripts/run_web_agent.sh to start</p>
         </div>
-        <div class="run-list" id="runList"></div>
-      </aside>
-
-      <section class="panel graph-panel">
-        <div class="panel-header">
-          <h2>Provenance graph</h2>
-          <span class="meta" id="graphMeta">0 nodes · 0 edges</span>
-        </div>
-        <div class="graph-toolbar">
-          <select id="graphScope" aria-label="Graph scope">
-            <option value="run" selected>Selected run</option>
-            <option value="all">All runs</option>
-          </select>
-          <select id="layoutMode" aria-label="Graph layout">
-            <option value="LR">Layers →</option>
-            <option value="TB">Layers ↓</option>
-          </select>
-          <button class="icon-button" id="zoomOut" type="button" title="Zoom out">−</button>
-          <button class="icon-button" id="zoomIn" type="button" title="Zoom in">+</button>
-          <button class="button" id="fitGraph" type="button">Fit</button>
-          <div class="spacer"></div>
-          <button class="button" id="snapshotButton" type="button">Snapshot</button>
-          <div class="replay-controls" id="replayControls">
-            <button class="button" id="replayButton" type="button">Replay</button>
-            <button class="icon-button" id="replayPlayPause" type="button" title="Pause or resume" hidden>Ⅱ</button>
-            <button class="icon-button" id="replayRestart" type="button" title="Restart" hidden>↻</button>
-            <select id="replaySpeed" hidden>
-              <option value="600">Fast</option>
-              <option value="1100" selected>Normal</option>
-              <option value="1700">Slow</option>
-            </select>
-            <button class="button" id="replayExit" type="button" hidden>Exit</button>
-            <span class="replay-label" id="replayLabel" hidden></span>
-          </div>
-        </div>
-        <div class="graph-canvas" id="graphCanvas">
-          <div class="graph-world" id="graphWorld">
-            <svg class="edge-svg" id="edgeSvg">
-              <defs>
-                <marker id="arrowMuted" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto" markerUnits="strokeWidth">
-                  <path d="M0,0 L8,4 L0,8 z" fill="rgba(148,163,184,0.72)"></path>
-                </marker>
-              </defs>
-            </svg>
-          </div>
-          <div class="graph-empty" id="graphEmpty" hidden>
-            <div>
-              <h2>No provenance yet</h2>
-              <p>Run the pure SDK agent once, then refresh this dashboard.</p>
+        <div v-else class="card-grid">
+          <div v-for="run in runs" :key="run.run_id" class="run-card" @click="openRun(run.run_id)">
+            <div class="card-top">
+              <span class="run-id" :title="run.run_id">{{ short(run.run_id, 8, 8) }}</span>
+              <span class="status-badge" :class="statusClass(run.status)">{{ run.status || 'unknown' }}</span>
+            </div>
+            <h3 class="card-title">{{ cardTitle(run) }}</h3>
+            <p class="card-objective">{{ run.objective || '(no objective)' }}</p>
+            <div class="card-meta">
+              <span>{{ cardMeta(run) }}</span>
+              <span v-if="run.parent_run_id" class="followup">↳ follow-up of {{ short(run.parent_run_id, 8, 4) }}</span>
             </div>
           </div>
-          <div class="graph-legend">
-            <span class="legend-chip"><i style="background:#2dd4bf"></i>origin</span>
-            <span class="legend-chip"><i style="background:#67e8f9"></i>run/call</span>
-            <span class="legend-chip"><i style="background:#a78bfa"></i>session</span>
-            <span class="legend-chip"><i style="background:#94a3b8"></i>evidence</span>
-            <span class="legend-chip"><i style="background:#fb7185"></i>goal</span>
-          </div>
-        </div>
-      </section>
-
-      <aside class="panel inspector">
-        <div class="tabs">
-          <button class="tab active" id="tabDetail" type="button" data-tab="detail">Detail</button>
-          <button class="tab" id="tabEvidence" type="button" data-tab="evidence">Evidence <span id="evidenceCount"></span></button>
-          <button class="tab" id="tabLog" type="button" data-tab="log">Log <span id="eventCount"></span></button>
-        </div>
-        <div class="inspector-body" id="inspectorBody"></div>
-      </aside>
-    </main>
-  </div>
-
-  <div class="modal" id="snapshotModal">
-    <div class="modal-card">
-      <div class="modal-header">
-        <div>
-          <h2>Run snapshot</h2>
-          <p class="detail-subtitle">Derived from runtime receipts only; not inferred facts or intents.</p>
-        </div>
-        <div class="top-actions">
-          <select id="snapshotFormat">
-            <option value="timeline">Timeline</option>
-            <option value="json">JSON</option>
-          </select>
-          <button class="button" id="copySnapshot" type="button">Copy</button>
-          <button class="button" id="closeSnapshot" type="button">Close</button>
         </div>
       </div>
-      <div class="modal-body"><pre id="snapshotText">Loading…</pre></div>
     </div>
+
+    <div v-else class="view">
+      <header class="topbar">
+        <button class="icon-btn" type="button" @click="goList" title="Back to runs" aria-label="Back to runs">
+          <svg width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M15 19l-7-7 7-7"/></svg>
+        </button>
+        <span class="run-id" :title="routeRunId">{{ short(routeRunId, 8, 8) }}</span>
+        <h2 class="card-title" style="flex:0 1 auto; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">{{ runHost }}</h2>
+        <span class="status-badge" :class="statusClass(runStatus)">{{ runStatus }}</span>
+        <div class="spacer"></div>
+        <div class="topbar-stats">{{ headerMeta }}</div>
+        <button v-if="!replay.active" class="btn violet" type="button" @click="startReplay" :disabled="!runEvents.length">
+          <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.8" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/><path d="M4 5v14"/></svg>
+          Replay
+        </button>
+        <div v-else class="replay-group">
+          <span class="replay-progress">{{ replay.index + 1 }} / {{ runEvents.length }}</span>
+          <button class="rbtn" type="button" @click="toggleReplay" :title="replay.playing ? 'Pause replay' : 'Resume replay'">
+            <svg v-if="replay.playing" width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path d="M8 6h3v12H8zM13 6h3v12h-3z"/></svg>
+            <svg v-else width="12" height="12" fill="currentColor" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>
+          </button>
+          <button class="rbtn" type="button" @click="restartReplay" title="Restart replay">
+            <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.9" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.708"/><path d="M3 3v6h6"/></svg>
+          </button>
+          <select v-model.number="replay.stepMs" class="rsel" aria-label="Replay speed">
+            <option :value="700">Fast</option>
+            <option :value="1100">Normal</option>
+            <option :value="1600">Slow</option>
+          </select>
+          <button class="rbtn" type="button" @click="exitReplay">Exit</button>
+        </div>
+        <button class="btn slate" type="button" @click="openSnapshot">
+          <svg width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><path d="M14.25 3H7.5A2.25 2.25 0 0 0 5.25 5.25v13.5A2.25 2.25 0 0 0 7.5 21h9a2.25 2.25 0 0 0 2.25-2.25V8.25L14.25 3Z"/><path d="M14.25 3v5.25h4.5"/><path d="M8.25 12h7.5M8.25 15h5.25"/></svg>
+          Snapshot
+        </button>
+      </header>
+      <div class="run-body">
+        <div class="graph-wrap">
+          <div class="graph-controls">
+            <button class="ctl btn-icon" type="button" @click="fitGraph" title="Fit graph" aria-label="Fit graph">
+              <svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24"><path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M16 3h3a2 2 0 0 1 2 2v3"/><path d="M8 21H5a2 2 0 0 1-2-2v-3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/></svg>
+            </button>
+            <select v-model="layoutMode" class="ctl" @change="relayout" aria-label="Graph layout">
+              <option value="dagre_tb">Dagre ↓</option>
+              <option value="dagre_lr">Dagre →</option>
+            </select>
+          </div>
+          <div ref="cyEl" class="cy"></div>
+        </div>
+        <aside class="side">
+          <div class="tabs">
+            <button type="button" class="tab" :class="{ active: sideTab === 'detail' }" @click="sideTab = 'detail'">Detail</button>
+            <button type="button" class="tab" :class="{ active: sideTab === 'evidence' }" @click="sideTab = 'evidence'">Evidence<span class="cnt">{{ evidenceRows.length }}</span></button>
+            <button type="button" class="tab" :class="{ active: sideTab === 'log' }" @click="sideTab = 'log'">Log<span class="cnt">{{ runEvents.length }}</span></button>
+          </div>
+
+          <div v-show="sideTab === 'detail'" class="tab-body">
+            <div v-if="!selectedNodeId && !selectedEdgeId">
+              <div class="kv-list">
+                <div class="kv"><span class="k">Status</span><span class="v">{{ runStatus }}</span></div>
+                <div class="kv"><span class="k">Mode</span><span class="v">{{ (detail && detail.run && detail.run.mode) || '—' }}</span></div>
+                <div class="kv"><span class="k">Started</span><span class="v">{{ fmtTime(runField('created_at')) }}</span></div>
+                <div class="kv"><span class="k">Duration</span><span class="v">{{ runDuration }}</span></div>
+                <div class="kv"><span class="k">Turns</span><span class="v">{{ runTurns }}</span></div>
+                <div class="kv"><span class="k">Cost</span><span class="v">{{ fmtCost(runCost) }}</span></div>
+                <div class="kv"><span class="k">Session</span><span class="v mono">{{ short(runField('primary_session_id'), 14, 10) }}</span></div>
+              </div>
+              <template v-if="reportText">
+                <h4 class="sec">Final report</h4>
+                <pre class="report">{{ reportText }}</pre>
+              </template>
+              <template v-if="followUps.length">
+                <h4 class="sec">Follow-ups</h4>
+                <div class="kv-list">
+                  <div class="kv" v-for="item in followUps" :key="item.intervention_id || item.id">
+                    <span class="k">{{ item.kind }}</span>
+                    <span class="v">{{ [item.status, item.prompt_preview].filter(Boolean).join(' · ') || '—' }}</span>
+                  </div>
+                </div>
+              </template>
+              <p class="hint">Click a node to inspect</p>
+            </div>
+            <div v-else class="node-card">
+              <div class="nc-head">
+                <span class="nc-chip" :style="{ background: chipColor.bg, color: chipColor.fg }">{{ selectedType }}</span>
+                <span class="nc-id">{{ selectedId }}</span>
+              </div>
+              <div class="nc-body">
+                <p class="nc-label">{{ selectedLabel }}</p>
+                <div class="kv-list">
+                  <div class="kv" v-for="field in selectedFields" :key="field[0]">
+                    <span class="k">{{ field[0] }}</span>
+                    <span class="v" :class="{ mono: field[2] === 'mono' }">{{ field[1] }}</span>
+                  </div>
+                </div>
+                <button class="link" type="button" @click="clearSelection">← Run overview</button>
+              </div>
+            </div>
+          </div>
+
+          <div v-show="sideTab === 'evidence'" class="tab-body">
+            <div v-if="!evidenceRows.length" class="empty-state" style="height:auto; padding:40px 0;">
+              <p class="empty-sub">No artifact receipts for this run.</p>
+            </div>
+            <div v-else>
+              <div v-for="item in evidenceRows" :key="item.receipt_id || item.sha256" class="ev-row">
+                <div class="ev-main">
+                  <div class="ev-title">{{ (item.tool_name || '—') + ' · ' + (item.source_kind || '—') }}</div>
+                  <span class="ev-ref mono" :title="item.source_ref || item.sha256 || ''">{{ item.source_ref || item.sha256 || '—' }}</span>
+                </div>
+                <div class="ev-side">
+                  <div>{{ fmtBytes(item.size) }}</div>
+                  <div class="mono">{{ fmtClock(item.captured_at) }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div v-show="sideTab === 'log'" class="tab-body" style="padding:8px;">
+            <div v-if="!runEvents.length" class="empty-state" style="height:auto; padding:40px 0;">
+              <p class="empty-sub">No runtime events recorded.</p>
+            </div>
+            <button v-for="(event, index) in runEvents" :key="index" type="button" class="log-row"
+              :class="['dot-' + event.type, { active: replay.active && index === replay.index, future: replay.active && index > replay.index }]"
+              @click="focusEvent(event)">
+              <span class="log-time">{{ fmtClock(event.timestamp) }}</span>
+              <span class="log-dot"></span>
+              <span class="log-main">
+                <span class="log-title">{{ event.title || event.type }}</span>
+                <span v-if="(event.meta || []).length" class="log-meta">{{ event.meta.filter(Boolean).join(' · ') }}</span>
+              </span>
+            </button>
+          </div>
+        </aside>
+      </div>
+    </div>
+
+    <div v-if="snapshot.visible" class="overlay" @click.self="snapshot.visible = false">
+      <div class="modal">
+        <div class="modal-head">
+          <div>
+            <h3>Run snapshot</h3>
+            <p class="sub">Derived from runtime receipts only; not inferred facts or intents.</p>
+          </div>
+          <div class="modal-actions">
+            <select v-model="snapshot.format" class="sel" @change="loadSnapshot" aria-label="Snapshot format">
+              <option value="timeline">Timeline</option>
+              <option value="json">JSON</option>
+            </select>
+            <button class="btn slate" type="button" @click="copySnapshot">{{ snapshot.copied ? 'Copied' : 'Copy' }}</button>
+            <button class="btn slate" type="button" @click="snapshot.visible = false">Close</button>
+          </div>
+        </div>
+        <div class="modal-body"><pre>{{ snapshot.text }}</pre></div>
+      </div>
+    </div>
+
+    <div v-if="error" class="error-banner">{{ error }}</div>
   </div>
 
-  <script>
-    const state = {
-      overview: null,
-      runs: [],
-      graph: { nodes: [], edges: [], events: [], counts: {}, notice: "" },
-      latestRunId: "",
-      selectedRunId: "",
-      detail: null,
-      selected: null,
-      inspectorTab: "detail",
-      query: "",
-      status: "all",
-      graphScope: "run",
-      loading: false,
-      view: { layout: "LR", scale: 1, x: 20, y: 20 },
-      positions: new Map(),
-      nodeElements: new Map(),
-      edgeElements: new Map(),
-      replay: { active: false, playing: false, index: -1, timer: null, stepMs: 1100 },
-    };
-
-    const byId = (id) => document.getElementById(id);
-    const NODE_SIZE = {
-      origin: [176, 74],
-      goal: [196, 78],
-      run: [236, 86],
-      call: [210, 74],
-      session: [210, 70],
-      evidence: [204, 66],
-    };
-    const SVG_NS = "http://www.w3.org/2000/svg";
-
-    function el(tag, className, text) {
-      const node = document.createElement(tag);
-      if (className) node.className = className;
-      if (text !== undefined && text !== null) node.textContent = String(text);
-      return node;
-    }
-
-    function svgEl(tag, attrs = {}) {
-      const node = document.createElementNS(SVG_NS, tag);
-      for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, String(value));
-      return node;
-    }
-
-    function pill(status) {
-      return el("span", `pill ${statusClass(status)}`, status || "unknown");
-    }
-
-    function statusClass(status) {
-      return String(status || "unknown").toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
-    }
-
-    function short(value, prefix = 10, suffix = 6) {
-      const text = String(value || "");
-      if (text.length <= prefix + suffix + 3) return text;
-      return `${text.slice(0, prefix)}…${text.slice(-suffix)}`;
-    }
-
-    function fmtTime(value) {
-      if (!value) return "—";
-      const date = new Date(value);
-      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleString();
-    }
-
-    function fmtClock(value) {
-      if (!value) return "—";
-      const date = new Date(value);
-      return Number.isNaN(date.getTime()) ? String(value) : date.toLocaleTimeString();
-    }
-
-    function fmtDuration(start, end) {
-      const a = Date.parse(start || "");
-      const b = Date.parse(end || start || "");
-      if (Number.isNaN(a) || Number.isNaN(b) || b < a) return "—";
-      const ms = b - a;
-      if (ms < 1000) return `${ms} ms`;
-      const seconds = ms / 1000;
-      if (seconds < 60) return `${seconds.toFixed(1)} s`;
-      return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
-    }
-
-    function fmtMoney(value) {
-      return typeof value === "number" ? `$${value.toFixed(4)}` : "—";
-    }
-
-    function fmtBytes(value) {
-      const size = Number(value || 0);
-      if (size < 1024) return `${size} B`;
-      if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KiB`;
-      return `${(size / 1024 / 1024).toFixed(1)} MiB`;
-    }
-
-    function setError(message) {
-      const banner = byId("errorBanner");
-      banner.textContent = message || "";
-      banner.classList.toggle("visible", Boolean(message));
-    }
-
-    async function api(path) {
-      const response = await fetch(path, { cache: "no-store" });
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      return response.json();
-    }
-
-    async function fetchText(path) {
-      const response = await fetch(path, { cache: "no-store" });
-      if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
-      return response.text();
-    }
-
-    function renderMetrics() {
-      const data = state.overview;
-      const metrics = byId("metrics");
-      metrics.replaceChildren();
-      if (!data) return;
-      const statuses = Object.entries(data.status_counts || {})
-        .map(([key, value]) => `${key}: ${value}`).join(" · ");
-      const usage = data.usage_totals || {};
-      const tokenNote = [
-        usage.input_tokens ? `in ${usage.input_tokens.toLocaleString()}` : "",
-        usage.output_tokens ? `out ${usage.output_tokens.toLocaleString()}` : "",
-      ].filter(Boolean).join(" · ");
-      const cards = [
-        ["Runs", data.counts.runs, statuses || "No recorded statuses"],
-        ["Success rate", data.success_rate === null ? "—" : `${Math.round(data.success_rate * 100)}%`, "Completed / total runs"],
-        ["Sessions", data.counts.sessions, "Shared + forked SDK sessions"],
-        ["Calls", data.counts.calls, tokenNote || "No usage reported"],
-        ["Turns", data.total_turns.toLocaleString(), "Across recorded calls"],
-        ["Cost", fmtMoney(data.total_cost_usd), `${data.counts.artifacts} artifact receipts`],
-      ];
-      for (const [label, value, note] of cards) {
-        const card = el("section", "metric");
-        card.append(el("div", "label", label));
-        card.append(el("div", "value", value));
-        card.append(el("div", "note", note));
-        metrics.append(card);
-      }
-      byId("updatedAt").textContent = `Updated ${fmtTime(data.generated_at)}`;
-    }
-
-    function filteredRuns() {
-      const query = state.query.trim().toLowerCase();
-      return state.runs.filter((run) => {
-        if (state.status !== "all" && String(run.status || "") !== state.status) return false;
-        if (!query) return true;
-        return [run.run_id, run.target, run.objective, run.mode, run.primary_session_id]
-          .some((value) => String(value || "").toLowerCase().includes(query));
-      });
-    }
-
-    function renderRunList() {
-      const list = byId("runList");
-      const runs = filteredRuns();
-      list.replaceChildren();
-      byId("runCount").textContent = `${runs.length} / ${state.runs.length}`;
-      if (!runs.length) {
-        list.append(el("div", "empty", "No runs match the current filters."));
-        return;
-      }
-      for (const run of runs) {
-        const item = el("button", `run-item${run.run_id === state.selectedRunId ? " active" : ""}`);
-        item.type = "button";
-        item.addEventListener("click", () => selectRun(run.run_id));
-        const top = el("div", "run-id");
-        top.append(el("span", "", short(run.run_id, 16, 8)));
-        top.append(pill(run.status));
-        item.append(top);
-        item.append(el("div", "run-objective", run.objective || "(no objective)"));
-        const meta = el("div", "run-meta");
-        meta.append(el("span", "", run.mode || "unknown"));
-        meta.append(el("span", "", `${run.call_count || 0} calls`));
-        meta.append(el("span", "", `${run.total_num_turns || 0} turns`));
-        meta.append(el("span", "", `${run.artifact_count || 0} artifacts`));
-        meta.append(el("span", "", fmtMoney(Number(run.total_cost_usd || 0))));
-        item.append(meta);
-        list.append(item);
-      }
-    }
-
-    function nodeById(id) {
-      return state.graph.nodes.find((node) => node.id === id) || null;
-    }
-
-    function edgeById(id) {
-      return state.graph.edges.find((edge) => edge.id === id) || null;
-    }
-
-    function nodeRunId(node) {
-      if (!node) return "";
-      if (node.type === "run") return String(node.id).replace(/^run:/, "");
-      return node.data?.run_id || node.data?.run_ids?.[0] || node.data?.origin_run_id || "";
-    }
-
-    function scopedGraph() {
-      const nodes = state.graph.nodes || [];
-      const edges = state.graph.edges || [];
-      if (state.graphScope !== "run" || !state.selectedRunId) return { nodes, edges };
-      const runId = state.selectedRunId;
-      const runNodeId = `run:${runId}`;
-      const selectedRun = nodes.find((node) => node.id === runNodeId);
-      if (!selectedRun) return { nodes: [], edges: [] };
-      const keep = new Set([runNodeId]);
-      for (const node of nodes) {
-        if ((node.type === "origin" || node.type === "goal") && (node.data?.run_ids || []).includes(runId)) keep.add(node.id);
-        if ((node.type === "call" || node.type === "evidence") && node.data?.run_id === runId) keep.add(node.id);
-        if (node.type === "run" && node.data?.parent_run_id === runId) keep.add(node.id);
-      }
-      if (selectedRun.data?.parent_run_id) keep.add(`run:${selectedRun.data.parent_run_id}`);
-      for (const edge of edges) {
-        if (keep.has(edge.source) && String(edge.target).startsWith("session:")) keep.add(edge.target);
-      }
-      return {
-        nodes: nodes.filter((node) => keep.has(node.id)),
-        edges: edges.filter((edge) => keep.has(edge.source) && keep.has(edge.target)),
-      };
-    }
-
-    function graphEvents() {
-      const events = state.graph.events || [];
-      if (state.graphScope !== "run" || !state.selectedRunId) return events;
-      return events.filter((event) => event.run_id === state.selectedRunId);
-    }
-
-    function eventTimestamp() {
-      const events = graphEvents();
-      if (!state.replay.active || state.replay.index < 0 || !events.length) return Infinity;
-      const event = events[Math.min(state.replay.index, events.length - 1)];
-      const parsed = Date.parse(event?.timestamp || "");
-      return Number.isNaN(parsed) ? Infinity : parsed;
-    }
-
-    function appearsBefore(value, cutoff) {
-      if (!state.replay.active) return true;
-      if (!value) return true;
-      const parsed = Date.parse(value);
-      return Number.isNaN(parsed) || parsed <= cutoff;
-    }
-
-    function visibleGraph() {
-      const cutoff = eventTimestamp();
-      const scoped = scopedGraph();
-      const nodes = scoped.nodes.filter((node) => appearsBefore(node.appears_at, cutoff));
-      const nodeIds = new Set(nodes.map((node) => node.id));
-      const edges = scoped.edges.filter((edge) => {
-        if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) return false;
-        return appearsBefore(edge.appears_at, cutoff);
-      });
-      return { nodes, edges };
-    }
-
-    function computeDepths(nodes, edges) {
-      const depths = new Map();
-      const nodeIds = new Set(nodes.map((node) => node.id));
-      const runNodes = nodes.filter((node) => node.type === "run");
-      const runIdToNode = new Map(runNodes.map((node) => [String(node.id).replace(/^run:/, ""), node]));
-      const nodeType = new Map(nodes.map((node) => [node.id, node.type]));
-      const incoming = new Map();
-      for (const edge of edges) {
-        if (!incoming.has(edge.target)) incoming.set(edge.target, []);
-        incoming.get(edge.target).push(edge);
-      }
-      for (const node of nodes) if (node.type === "origin") depths.set(node.id, 0);
-      const sortedRuns = runNodes.slice().sort((a, b) => String(a.appears_at || "").localeCompare(String(b.appears_at || "")));
-      for (const node of sortedRuns) {
-        const runId = String(node.id).replace(/^run:/, "");
-        const parent = node.data?.parent_run_id;
-        const parentNode = parent ? runIdToNode.get(String(parent)) : null;
-        depths.set(node.id, (parentNode ? (depths.get(parentNode.id) || 0) : 0) + 1);
-      }
-      let changed = true;
-      let guard = 0;
-      while (changed && guard++ < 12) {
-        changed = false;
-        for (const node of nodes) {
-          if (depths.has(node.id) || node.type === "goal") continue;
-          const sources = (incoming.get(node.id) || [])
-            .map((edge) => edge.source)
-            .filter((source) => depths.has(source) && nodeIds.has(source));
-          if (!sources.length) continue;
-          depths.set(node.id, Math.max(...sources.map((source) => depths.get(source))) + 1);
-          changed = true;
-        }
-      }
-      let maxDepth = Math.max(0, ...depths.values());
-      for (const node of nodes) {
-        if (!depths.has(node.id) && node.type !== "goal") depths.set(node.id, Math.min(maxDepth, 1));
-      }
-      maxDepth = Math.max(0, ...depths.values());
-      for (const node of nodes) {
-        if (node.type !== "goal") continue;
-        const sourceDepths = (node.data?.run_ids || [])
-          .map((runId) => depths.get(`run:${runId}`))
-          .filter((depth) => Number.isInteger(depth));
-        depths.set(node.id, sourceDepths.length ? Math.max(...sourceDepths) + 1 : maxDepth + 1);
-      }
-      return depths;
-    }
-
-    function computeLayout(nodes, edges) {
-      const depths = computeDepths(nodes, edges);
-      const byDepth = new Map();
-      for (const node of nodes) {
-        const depth = depths.get(node.id) || 0;
-        if (!byDepth.has(depth)) byDepth.set(depth, []);
-        byDepth.get(depth).push(node);
-      }
-      const direction = state.view.layout;
-      const gapX = direction === "LR" ? 292 : 118;
-      const gapY = direction === "LR" ? 108 : 268;
-      const margin = 48;
-      const positions = new Map();
-      let maxX = 0;
-      let maxY = 0;
-      for (const [depth, group] of byDepth.entries()) {
-        group.sort((a, b) => String(a.appears_at || "").localeCompare(String(b.appears_at || "")) || a.id.localeCompare(b.id));
-        group.forEach((node, index) => {
-          const [w, h] = NODE_SIZE[node.type] || [190, 70];
-          const x = direction === "LR" ? margin + depth * gapX + w / 2 : margin + index * gapY + w / 2;
-          const y = direction === "LR" ? margin + index * gapY + h / 2 : margin + depth * gapX + h / 2;
-          positions.set(node.id, { x, y, w, h, depth, node });
-          maxX = Math.max(maxX, x + w / 2 + margin);
-          maxY = Math.max(maxY, y + h / 2 + margin);
-        });
-      }
-      return { positions, width: Math.max(maxX, 360), height: Math.max(maxY, 260) };
-    }
-
-    function edgePath(source, target) {
-      if (state.view.layout === "TB") {
-        const sx = source.x;
-        const sy = source.y + source.h / 2;
-        const tx = target.x;
-        const ty = target.y - target.h / 2 - 8;
-        const dy = Math.max(42, Math.abs(ty - sy) * 0.42);
-        return `M ${sx} ${sy} C ${sx} ${sy + dy}, ${tx} ${ty - dy}, ${tx} ${ty}`;
-      }
-      const sx = source.x + source.w / 2;
-      const sy = source.y;
-      const tx = target.x - target.w / 2 - 9;
-      const ty = target.y;
-      const dx = Math.max(48, Math.abs(tx - sx) * 0.38);
-      return `M ${sx} ${sy} C ${sx + dx} ${sy}, ${tx - dx} ${ty}, ${tx} ${ty}`;
-    }
-
-    function edgeLabelPoint(source, target) {
-      if (state.view.layout === "TB") {
-        return { x: (source.x + target.x) / 2 + 8, y: (source.y + target.y) / 2 };
-      }
-      return { x: (source.x + target.x) / 2, y: (source.y + target.y) / 2 - 10 };
-    }
-
-    function relatedSelection() {
-      if (!state.selected) return { nodes: new Set(), edges: new Set(), active: false };
-      const nodes = new Set();
-      const edgeIds = new Set();
-      const edges = state.graph.edges || [];
-      if (state.selected.kind === "edge") {
-        const edge = edgeById(state.selected.id);
-        if (edge) {
-          edgeIds.add(edge.id);
-          nodes.add(edge.source);
-          nodes.add(edge.target);
-        }
-        return { nodes, edges: edgeIds, active: true };
-      }
-      const start = state.selected.id;
-      if (!start) return { nodes, edges: edgeIds, active: false };
-      const queue = [start];
-      nodes.add(start);
-      while (queue.length) {
-        const current = queue.shift();
-        for (const edge of edges) {
-          if (edge.source === current && !nodes.has(edge.target)) {
-            nodes.add(edge.target);
-            queue.push(edge.target);
-          }
-          if (edge.target === current && !nodes.has(edge.source)) {
-            nodes.add(edge.source);
-            queue.push(edge.source);
-          }
-          if (edge.source === current || edge.target === current) edgeIds.add(edge.id);
-        }
-      }
-      for (const edge of edges) if (nodes.has(edge.source) && nodes.has(edge.target)) edgeIds.add(edge.id);
-      return { nodes, edges: edgeIds, active: true };
-    }
-
-    function currentEventTarget() {
-      if (!state.replay.active || state.replay.index < 0) return null;
-      return graphEvents()[state.replay.index] || null;
-    }
-
-    function renderGraph() {
-      const canvas = byId("graphCanvas");
-      const world = byId("graphWorld");
-      const svg = byId("edgeSvg");
-      const { nodes, edges } = visibleGraph();
-      state.nodeElements.clear();
-      state.edgeElements.clear();
-      svg.querySelectorAll(".edge-wrap,.edge-label").forEach((node) => node.remove());
-      world.querySelectorAll(".graph-node").forEach((node) => node.remove());
-      byId("graphMeta").textContent = `${nodes.length} nodes · ${edges.length} edges`;
-      byId("graphEmpty").hidden = nodes.length > 0;
-      if (!nodes.length) return;
-
-      const layout = computeLayout(nodes, edges);
-      state.positions = layout.positions;
-      world.style.width = `${layout.width}px`;
-      world.style.height = `${layout.height}px`;
-      svg.setAttribute("width", layout.width);
-      svg.setAttribute("height", layout.height);
-      svg.setAttribute("viewBox", `0 0 ${layout.width} ${layout.height}`);
-
-      const related = relatedSelection();
-      const currentEvent = currentEventTarget();
-      for (const edge of edges) {
-        const source = layout.positions.get(edge.source);
-        const target = layout.positions.get(edge.target);
-        if (!source || !target) continue;
-        const wrap = svgEl("g", { class: "edge-wrap" });
-        const path = svgEl("path", {
-          d: edgePath(source, target),
-          class: `graph-edge kind-${statusClass(edge.kind)} status-${statusClass(edge.status)}`,
-        });
-        if (related.active) path.classList.add(related.edges.has(edge.id) ? "related" : "dim");
-        if (state.selected?.kind === "edge" && state.selected.id === edge.id) path.classList.add("related");
-        if (currentEvent?.target_type === "edge" && currentEvent.target_id === edge.id) path.classList.add("related");
-        const hit = svgEl("path", { d: edgePath(source, target), class: "graph-edge-hit" });
-        hit.addEventListener("pointerdown", (event) => event.stopPropagation());
-        hit.addEventListener("click", () => selectEdge(edge.id));
-        wrap.append(path, hit);
-        svg.append(wrap);
-        state.edgeElements.set(edge.id, wrap);
-        if (edge.label) {
-          const point = edgeLabelPoint(source, target);
-          const label = svgEl("text", {
-            x: point.x,
-            y: point.y,
-            "text-anchor": "middle",
-            class: "edge-label",
-          });
-          label.textContent = edge.label;
-          if (related.active && !related.edges.has(edge.id)) label.classList.add("dim");
-          svg.append(label);
-        }
-      }
-
-      for (const node of nodes) {
-        const position = layout.positions.get(node.id);
-        if (!position) continue;
-        const card = el(
-          "button",
-          `graph-node type-${statusClass(node.type)} status-${statusClass(node.status)}`
-        );
-        card.type = "button";
-        card.style.left = `${position.x - position.w / 2}px`;
-        card.style.top = `${position.y - position.h / 2}px`;
-        card.style.width = `${position.w}px`;
-        card.style.height = `${position.h}px`;
-        card.dataset.nodeId = node.id;
-        card.title = node.subtitle || node.label;
-        card.append(el("div", "node-type", node.type));
-        card.append(el("div", "node-label", node.label || node.id));
-        if (node.subtitle) card.append(el("div", "node-subtitle", node.subtitle));
-        if (state.selected?.kind === "node" && state.selected.id === node.id) card.classList.add("selected");
-        if (related.active) card.classList.add(related.nodes.has(node.id) ? "related" : "dim");
-        if (currentEvent?.target_type === "node" && currentEvent.target_id === node.id) card.classList.add("event-focus");
-        card.addEventListener("pointerdown", (event) => event.stopPropagation());
-        card.addEventListener("click", () => selectNode(node.id));
-        world.append(card);
-        state.nodeElements.set(node.id, card);
-      }
-      applyTransform();
-    }
-
-    function applyTransform() {
-      byId("graphWorld").style.transform = `translate(${state.view.x}px, ${state.view.y}px) scale(${state.view.scale})`;
-    }
-
-    function fitGraph() {
-      const canvas = byId("graphCanvas");
-      const world = byId("graphWorld");
-      const width = Number.parseFloat(world.style.width) || canvas.clientWidth;
-      const height = Number.parseFloat(world.style.height) || canvas.clientHeight;
-      const scale = Math.max(0.18, Math.min(1.12, (canvas.clientWidth - 44) / Math.max(width, 1), (canvas.clientHeight - 44) / Math.max(height, 1)));
-      state.view.scale = scale;
-      state.view.x = (canvas.clientWidth - width * scale) / 2;
-      state.view.y = (canvas.clientHeight - height * scale) / 2;
-      applyTransform();
-    }
-
-    function zoomBy(factor, center) {
-      const canvas = byId("graphCanvas");
-      const rect = canvas.getBoundingClientRect();
-      const cx = center?.x ?? rect.width / 2;
-      const cy = center?.y ?? rect.height / 2;
-      const oldScale = state.view.scale;
-      const next = Math.max(0.18, Math.min(2.4, oldScale * factor));
-      const wx = (cx - state.view.x) / oldScale;
-      const wy = (cy - state.view.y) / oldScale;
-      state.view.scale = next;
-      state.view.x = cx - wx * next;
-      state.view.y = cy - wy * next;
-      applyTransform();
-    }
-
-    function centerNode(nodeId) {
-      const position = state.positions.get(nodeId);
-      if (!position) return;
-      const canvas = byId("graphCanvas");
-      state.view.scale = Math.max(state.view.scale, 0.72);
-      state.view.x = canvas.clientWidth / 2 - position.x * state.view.scale;
-      state.view.y = canvas.clientHeight / 2 - position.y * state.view.scale;
-      applyTransform();
-    }
-
-    function selectNode(nodeId, options = {}) {
-      const node = nodeById(nodeId);
-      if (!node) return;
-      state.selected = { kind: "node", id: nodeId };
-      const runId = nodeRunId(node);
-      if (runId && runId !== state.selectedRunId) selectRun(runId, { preserveGraphSelection: true });
-      renderGraph();
-      renderInspector();
-      if (options.center !== false) centerNode(nodeId);
-    }
-
-    function selectEdge(edgeId) {
-      const edge = edgeById(edgeId);
-      if (!edge) return;
-      state.selected = { kind: "edge", id: edgeId };
-      const runId = edge.data?.result_run_id || edge.data?.run_id || "";
-      if (runId && runId !== state.selectedRunId) selectRun(runId, { preserveGraphSelection: true });
-      renderGraph();
-      renderInspector();
-      centerNode(edge.target);
-    }
-
-    function field(name, value) {
-      const box = el("div", "field");
-      const content = el("div", "value");
-      if (value instanceof Node) content.append(value);
-      else content.textContent = value ?? "—";
-      box.append(el("div", "name", name));
-      box.append(content);
-      return box;
-    }
-
-    function table(headers, rows) {
-      const tableNode = el("table");
-      const thead = el("thead");
-      const headRow = el("tr");
-      for (const head of headers) headRow.append(el("th", "", head));
-      thead.append(headRow);
-      const tbody = el("tbody");
-      for (const cells of rows) {
-        const row = el("tr");
-        for (const cell of cells) row.append(cell instanceof Node ? el("td").appendChild(cell).parentNode : el("td", "", cell));
-        tbody.append(row);
-      }
-      tableNode.append(thead, tbody);
-      return tableNode;
-    }
-
-    function linkButton(text, onClick) {
-      const button = el("button", "link-button", text);
-      button.type = "button";
-      button.addEventListener("click", onClick);
-      return button;
-    }
-
-    function renderRunDetail(container) {
-      const detail = state.detail;
-      if (!detail || !detail.run) {
-        container.append(el("div", "empty", "Select a run or graph node to inspect its runtime provenance."));
-        return;
-      }
-      const run = detail.run;
-      const title = el("div", "detail-title");
-      const heading = el("div");
-      heading.append(el("h2", "", run.objective || run.run_id));
-      heading.append(el("div", "detail-subtitle", `${run.target || "no target"} · ${run.run_id}`));
-      title.append(heading, pill(run.status));
-      container.append(title);
-      const fields = el("div", "field-grid");
-      fields.append(field("Mode", run.mode));
-      fields.append(field("Session", short(run.primary_session_id, 14, 10)));
-      fields.append(field("Created", fmtTime(run.created_at)));
-      fields.append(field("Updated", fmtTime(run.updated_at)));
-      fields.append(field("Parent run", run.parent_run_id ? linkButton(short(run.parent_run_id, 18, 8), () => selectNode(`run:${run.parent_run_id}`)) : "—"));
-      fields.append(field("Artifacts", String((detail.artifacts || []).length)));
-      container.append(fields);
-
-      if ((detail.session_lineage || []).length) {
-        const section = el("section", "subsection");
-        section.append(el("h3", "", "Session lineage"));
-        const chips = el("div", "chips");
-        for (const session of detail.session_lineage) {
-          const chip = el("button", "chip", short(session.session_id, 14, 10));
-          chip.type = "button";
-          chip.addEventListener("click", () => selectNode(`session:${session.session_id}`));
-          chips.append(chip);
-        }
-        section.append(chips);
-        container.append(section);
-      }
-
-      const calls = detail.calls || [];
-      const callsSection = el("section", "subsection");
-      callsSection.append(el("h3", "", `Calls (${calls.length})`));
-      if (calls.length) {
-        callsSection.append(table(
-          ["Call", "Status", "Duration", "Turns", "Cost"],
-          calls.map((call) => [
-            linkButton(short(call.call_id, 12, 8), () => selectNode(`call:${call.call_id}`)),
-            pill(call.result_status),
-            fmtDuration(call.started_at, call.ended_at),
-            String(call.num_turns ?? "—"),
-            fmtMoney(call.cost_usd),
-          ]),
-        ));
-      } else {
-        callsSection.append(el("div", "empty", "No call receipt recorded for this run."));
-      }
-      container.append(callsSection);
-
-      const interventions = detail.interventions || [];
-      const interventionSection = el("section", "subsection");
-      interventionSection.append(el("h3", "", `Follow-ups (${interventions.length})`));
-      if (interventions.length) {
-        interventionSection.append(table(
-          ["Kind", "Status", "Source", "Result", "Message"],
-          interventions.map((item) => [
-            item.kind,
-            pill(item.status),
-            linkButton(short(item.source_run_id, 10, 6), () => selectNode(`run:${item.source_run_id}`)),
-            linkButton(short(item.result_run_id, 10, 6), () => selectNode(`run:${item.result_run_id}`)),
-            item.prompt_preview || "—",
-          ]),
-        ));
-      } else {
-        interventionSection.append(el("div", "empty", "No inspect/resume/fork interventions recorded."));
-      }
-      container.append(interventionSection);
-
-      const record = detail.record || {};
-      const recordText = record.assistant_text || record.result || "";
-      const recordSection = el("section", "subsection");
-      recordSection.append(el("h3", "", "Run summary"));
-      if (recordText) {
-        recordSection.append(el("pre", "record", recordText));
-      } else if (Object.keys(record).length) {
-        recordSection.append(el("pre", "record", JSON.stringify(record, null, 2)));
-      } else {
-        recordSection.append(el("div", "empty", "No run summary JSON found for this run."));
-      }
-      container.append(recordSection);
-    }
-
-    function renderSelectedNode(container) {
-      const node = nodeById(state.selected?.id);
-      if (!node) return false;
-      const title = el("div", "detail-title");
-      const heading = el("div");
-      heading.append(el("h2", "", node.label));
-      heading.append(el("div", "detail-subtitle", `${node.type} · ${node.id}`));
-      title.append(heading, pill(node.status));
-      container.append(title);
-      const data = node.data || {};
-      const fields = el("div", "field-grid");
-
-      if (node.type === "run") {
-        renderRunDetail(container);
-        return true;
-      }
-      if (node.type === "origin" || node.type === "goal") {
-        fields.append(field("Target", data.target));
-        fields.append(field("Objective", data.objective));
-        fields.append(field("Runs", String((data.run_ids || []).length)));
-        fields.append(field("Boundary", node.type === "goal" ? "stated / reported, not proof" : "stated input"));
-        container.append(fields);
-        const section = el("section", "subsection");
-        section.append(el("h3", "", "Connected runs"));
-        const chips = el("div", "chips");
-        for (const runId of data.run_ids || []) {
-          const chip = el("button", "chip", short(runId, 18, 8));
-          chip.type = "button";
-          chip.addEventListener("click", () => selectNode(`run:${runId}`));
-          chips.append(chip);
-        }
-        section.append(chips);
-        container.append(section);
-        return true;
-      }
-
-      if (node.type === "call") {
-        fields.append(field("Status", data.result_status));
-        fields.append(field("Run", data.run_id));
-        fields.append(field("Session", short(data.session_id, 16, 10)));
-        fields.append(field("Started", fmtTime(data.started_at)));
-        fields.append(field("Ended", fmtTime(data.ended_at)));
-        fields.append(field("Turns", data.num_turns ?? "—"));
-        fields.append(field("Cost", fmtMoney(data.cost_usd)));
-        fields.append(field("Terminal", data.terminal_reason || data.error_class));
-        container.append(fields);
-        if (Object.keys(data.usage || {}).length) {
-          const section = el("section", "subsection");
-          section.append(el("h3", "", "Usage"));
-          section.append(el("pre", "record", JSON.stringify(data.usage, null, 2)));
-          container.append(section);
-        }
-        return true;
-      }
-      if (node.type === "session") {
-        fields.append(field("Status", data.status));
-        fields.append(field("Origin run", data.origin_run_id));
-        fields.append(field("Parent session", data.parent_session_id || "—"));
-        fields.append(field("Created", fmtTime(data.created_at)));
-        fields.append(field("Last used", fmtTime(data.last_used_at)));
-        fields.append(field("Fork reason", data.fork_reason || "—"));
-        container.append(fields);
-        const section = el("section", "subsection");
-        section.append(el("h3", "", "SDK signature"));
-        section.append(el("pre", "record", data.sdk_signature || "—"));
-        container.append(section);
-        return true;
-      }
-      if (node.type === "evidence") {
-        fields.append(field("Run", data.run_id));
-        fields.append(field("Call", data.call_id || "run-scoped"));
-        fields.append(field("Source kinds", (data.source_kinds || []).join(", ")));
-        fields.append(field("Tools", (data.tool_names || []).join(", ")));
-        fields.append(field("Receipts", String(data.count || 0)));
-        fields.append(field("Total size", fmtBytes(data.total_size)));
-        container.append(fields);
-        const breakdown = data.breakdown || [];
-        if (breakdown.length) {
-          const breakdownSection = el("section", "subsection");
-          breakdownSection.append(el("h3", "", "Evidence sources"));
-          breakdownSection.append(table(
-            ["Tool", "Kind", "Count", "Size"],
-            breakdown.map((item) => [
-              item.tool_name || "—",
-              item.source_kind || "—",
-              String(item.count || 0),
-              fmtBytes(item.total_size),
-            ]),
-          ));
-          container.append(breakdownSection);
-        }
-        const section = el("section", "subsection");
-        section.append(el("h3", "", "Receipts shown"));
-        const receipts = data.receipts || [];
-        if (receipts.length) {
-          section.append(table(
-            ["Receipt", "Ref", "Type", "Size"],
-            receipts.slice(0, 8).map((item) => [
-              el("span", "mono", short(item.receipt_id, 12, 8)),
-              el("span", "mono", short(item.source_ref || item.sha256, 18, 10)),
-              item.media_type || "—",
-              fmtBytes(item.size),
-            ]),
-          ));
-        } else {
-          section.append(el("div", "empty", "No receipt preview in this group."));
-        }
-        container.append(section);
-        return true;
-      }
-      return false;
-    }
-
-    function renderSelectedEdge(container) {
-      const edge = edgeById(state.selected?.id);
-      if (!edge) return false;
-      const title = el("div", "detail-title");
-      const heading = el("div");
-      heading.append(el("h2", "", edge.label || edge.kind));
-      heading.append(el("div", "detail-subtitle", edge.id));
-      title.append(heading, pill(edge.status));
-      container.append(title);
-      const data = edge.data || {};
-      const fields = el("div", "field-grid");
-      fields.append(field("Kind", edge.kind));
-      fields.append(field("Source", linkButton(edge.source, () => selectNode(edge.source))));
-      fields.append(field("Target", linkButton(edge.target, () => selectNode(edge.target))));
-      fields.append(field("Appears", fmtTime(edge.appears_at)));
-      fields.append(field("Status", edge.status));
-      fields.append(field("Run", data.run_id || data.result_run_id || "—"));
-      container.append(fields);
-      const detailKeys = ["kind", "status", "source_run_id", "result_run_id", "session_id", "prompt_preview", "detail", "created_at", "updated_at"];
-      const detail = {};
-      for (const key of detailKeys) if (data[key] !== undefined && data[key] !== "") detail[key] = data[key];
-      if (Object.keys(detail).length) {
-        const section = el("section", "subsection");
-        section.append(el("h3", "", "Receipt"));
-        section.append(el("pre", "record", JSON.stringify(detail, null, 2)));
-        container.append(section);
-      }
-      return true;
-    }
-
-    function evidenceRows() {
-      if (state.selected?.kind === "node") {
-        const node = nodeById(state.selected.id);
-        if (node?.type === "evidence") return node.data?.receipts || [];
-      }
-      return state.detail?.artifacts || [];
-    }
-
-    function renderEvidence(container) {
-      const rows = evidenceRows();
-      byId("evidenceCount").textContent = rows.length ? ` ${rows.length}` : "";
-      const title = el("div", "detail-title");
-      title.append(el("h2", "", "Artifact receipts"));
-      title.append(pill("captured"));
-      container.append(title);
-      const note = el("p", "detail-subtitle", "Raw evidence stays immutable and content-addressed. This view shows provenance metadata, not inferred facts.");
-      container.append(note);
-      const section = el("section", "subsection");
-      section.append(el("h3", "", `Receipts (${rows.length})`));
-      if (rows.length) {
-        section.append(table(
-          ["Receipt", "Tool", "Kind", "Ref", "Size", "Captured"],
-          rows.map((item) => [
-            el("span", "mono", short(item.receipt_id, 12, 8)),
-            item.tool_name || "—",
-            item.source_kind || "—",
-            el("span", "mono", short(item.source_ref || item.sha256, 16, 10)),
-            fmtBytes(item.size),
-            fmtClock(item.captured_at),
-          ]),
-        ));
-      } else {
-        section.append(el("div", "empty", "No artifact receipts available for the current selection."));
-      }
-      container.append(section);
-    }
-
-    function renderLog(container) {
-      const events = graphEvents();
-      byId("eventCount").textContent = events.length ? ` ${events.length}` : "";
-      const title = el("div", "detail-title");
-      title.append(el("h2", "", "Runtime event log"));
-      title.append(pill(state.replay.active ? `replay ${state.replay.index + 1}/${events.length}` : "observed"));
-      container.append(title);
-      container.append(el("p", "detail-subtitle", "Events are synthesized from stored run, call, intervention, session, and artifact timestamps."));
-      const list = el("div", "event-list");
-      const replayIndex = state.replay.active ? state.replay.index : Infinity;
-      events.forEach((event, index) => {
-        const item = el("button", `event-item type-${statusClass(event.type)}${index === replayIndex ? " active" : ""}${index > replayIndex ? " future" : ""}`);
-        item.type = "button";
-        item.disabled = index > replayIndex;
-        item.append(el("span", "event-dot"));
-        const body = el("div");
-        body.append(el("div", "event-title", event.title || event.type));
-        const meta = (event.meta || []).join(" · ");
-        if (meta) body.append(el("div", "event-meta", meta));
-        body.append(el("div", "event-time", `${fmtTime(event.timestamp)} · ${event.type}`));
-        item.append(body);
-        item.addEventListener("click", () => {
-          if (event.target_type === "edge") selectEdge(event.target_id);
-          else selectNode(event.target_id);
-          if (event.run_id) selectRun(event.run_id, { preserveGraphSelection: true });
-        });
-        list.append(item);
-      });
-      if (!events.length) list.append(el("div", "empty", "No runtime events have been recorded."));
-      container.append(list);
-    }
-
-    function renderInspector() {
-      const container = byId("inspectorBody");
-      container.replaceChildren();
-      document.querySelectorAll(".tab").forEach((tab) => {
-        tab.classList.toggle("active", tab.dataset.tab === state.inspectorTab);
-      });
-      if (state.inspectorTab === "evidence") {
-        renderEvidence(container);
-        return;
-      }
-      if (state.inspectorTab === "log") {
-        renderLog(container);
-        return;
-      }
-      byId("evidenceCount").textContent = (state.detail?.artifacts || []).length ? ` ${(state.detail.artifacts || []).length}` : "";
-      byId("eventCount").textContent = graphEvents().length ? ` ${graphEvents().length}` : "";
-      let handled = false;
-      if (state.selected?.kind === "node") handled = renderSelectedNode(container);
-      if (!handled && state.selected?.kind === "edge") handled = renderSelectedEdge(container);
-      if (!handled) renderRunDetail(container);
-    }
-
-    async function selectRun(runId, options = {}) {
-      if (!runId) return;
-      const runChanged = state.selectedRunId !== runId;
-      state.selectedRunId = runId;
-      if (!options.preserveGraphSelection) state.selected = null;
-      if (!options.preserveGraphSelection || (runChanged && state.graphScope === "run")) {
-        renderGraph();
-        if (runChanged && state.graphScope === "run") requestAnimationFrame(fitGraph);
-      }
-      renderRunList();
-      try {
-        state.detail = await api(`/api/runs/${encodeURIComponent(runId)}`);
-        renderInspector();
-      } catch (error) {
-        setError(`Could not load run ${runId}: ${error.message}`);
-      }
-    }
-
-    function eventWeight(event) {
-      const type = event?.type || "";
-      if (type === "call_started" || type === "call_finished" || type === "run_status") return 1.35;
-      if (type.startsWith("intervention")) return 1.2;
-      if (type === "evidence_captured") return 0.52;
-      return 0.9;
-    }
-
-    function replayDelay() {
-      const event = graphEvents()[state.replay.index] || {};
-      return Math.round(Number(state.replay.stepMs || 1100) * eventWeight(event));
-    }
-
-    function stopReplayTimer() {
-      if (state.replay.timer) clearTimeout(state.replay.timer);
-      state.replay.timer = null;
-    }
-
-    function applyReplayFrame(index) {
-      const events = graphEvents();
-      state.replay.index = Math.max(-1, Math.min(index, events.length - 1));
-      state.replay.playing = state.replay.index < events.length - 1 && state.replay.playing;
-      byId("replayLabel").textContent = `Replay ${state.replay.index + 1} / ${events.length}`;
-      renderGraph();
-      renderInspector();
-      const event = events[state.replay.index];
-      if (event?.target_id) {
-        requestAnimationFrame(() => centerNode(event.target_type === "edge" ? (edgeById(event.target_id)?.target || event.target_id) : event.target_id));
-      }
-    }
-
-    function scheduleReplay() {
-      stopReplayTimer();
-      if (!state.replay.active || !state.replay.playing) return;
-      if (state.replay.index >= graphEvents().length - 1) {
-        state.replay.playing = false;
-        updateReplayControls();
-        return;
-      }
-      state.replay.timer = setTimeout(() => {
-        applyReplayFrame(state.replay.index + 1);
-        scheduleReplay();
-      }, replayDelay());
-    }
-
-    function updateReplayControls() {
-      const active = state.replay.active;
-      byId("replayButton").hidden = active;
-      byId("replayPlayPause").hidden = !active;
-      byId("replayRestart").hidden = !active;
-      byId("replaySpeed").hidden = !active;
-      byId("replayExit").hidden = !active;
-      byId("replayLabel").hidden = !active;
-      byId("replayPlayPause").textContent = state.replay.playing ? "Ⅱ" : "▶";
-      if (!active) byId("replayLabel").textContent = "";
-    }
-
-    function startReplay() {
-      if (!graphEvents().length) return;
-      state.replay.active = true;
-      state.replay.playing = true;
-      state.replay.index = -1;
-      state.inspectorTab = "log";
-      updateReplayControls();
-      applyReplayFrame(0);
-      scheduleReplay();
-    }
-
-    function exitReplay() {
-      stopReplayTimer();
-      state.replay.active = false;
-      state.replay.playing = false;
-      state.replay.index = -1;
-      updateReplayControls();
-      renderGraph();
-      renderInspector();
-    }
-
-    async function openSnapshot() {
-      const modal = byId("snapshotModal");
-      const format = byId("snapshotFormat").value;
-      const output = byId("snapshotText");
-      modal.classList.add("visible");
-      output.textContent = "Loading…";
-      try {
-        if (format === "json") output.textContent = JSON.stringify(await api("/api/export?format=json"), null, 2);
-        else output.textContent = await fetchText("/api/export?format=timeline");
-      } catch (error) {
-        output.textContent = `Snapshot failed: ${error.message}`;
-      }
-    }
-
-    async function refresh(selectLatest = false) {
-      if (state.loading || state.replay.active) return;
-      state.loading = true;
-      try {
-        const [overview, runs, graph] = await Promise.all([
-          api("/api/overview"),
-          api("/api/runs"),
-          api("/api/graph"),
-        ]);
-        state.overview = overview;
-        state.runs = runs.runs || [];
-        state.graph = graph;
-        state.latestRunId = runs.latest_run_id || "";
-        setError("");
-        renderMetrics();
-        renderRunList();
-        renderGraph();
-        if (!state.selectedRunId || selectLatest || !state.runs.some((run) => run.run_id === state.selectedRunId)) {
-          if (state.latestRunId) await selectRun(state.latestRunId);
-          else {
-            state.detail = null;
-            renderInspector();
-          }
-        } else {
-          state.detail = await api(`/api/runs/${encodeURIComponent(state.selectedRunId)}`);
-          renderInspector();
-        }
-        if (state.selected?.kind === "node" && !nodeById(state.selected.id)) state.selected = null;
-        if (state.selected?.kind === "edge" && !edgeById(state.selected.id)) state.selected = null;
-      } catch (error) {
-        setError(`Dashboard refresh failed: ${error.message}`);
-      } finally {
-        state.loading = false;
-      }
-    }
-
-    function bindGraphPanZoom() {
-      const canvas = byId("graphCanvas");
-      let drag = null;
-      canvas.addEventListener("pointerdown", (event) => {
-        if (event.target.closest(".graph-node") || event.target.closest(".graph-edge-hit")) return;
-        drag = { x: event.clientX, y: event.clientY, viewX: state.view.x, viewY: state.view.y };
-        canvas.classList.add("dragging");
-        canvas.setPointerCapture(event.pointerId);
-      });
-      canvas.addEventListener("pointermove", (event) => {
-        if (!drag) return;
-        state.view.x = drag.viewX + event.clientX - drag.x;
-        state.view.y = drag.viewY + event.clientY - drag.y;
-        applyTransform();
-      });
-      const endDrag = (event) => {
-        if (!drag) return;
-        drag = null;
-        canvas.classList.remove("dragging");
-        try { canvas.releasePointerCapture(event.pointerId); } catch (_) {}
-      };
-      canvas.addEventListener("pointerup", endDrag);
-      canvas.addEventListener("pointercancel", endDrag);
-      canvas.addEventListener("wheel", (event) => {
-        if (!event.ctrlKey && !event.metaKey) return;
-        event.preventDefault();
-        const rect = canvas.getBoundingClientRect();
-        zoomBy(event.deltaY < 0 ? 1.11 : 0.9, {
-          x: event.clientX - rect.left,
-          y: event.clientY - rect.top,
-        });
-      }, { passive: false });
-    }
-
-    byId("refreshButton").addEventListener("click", () => refresh(false));
-    byId("searchInput").addEventListener("input", (event) => {
-      state.query = event.target.value;
-      renderRunList();
-    });
-    byId("statusFilter").addEventListener("change", (event) => {
-      state.status = event.target.value;
-      renderRunList();
-    });
-    byId("graphScope").addEventListener("change", (event) => {
-      if (state.replay.active) exitReplay();
-      state.graphScope = event.target.value;
-      state.selected = null;
-      renderGraph();
-      renderInspector();
-      requestAnimationFrame(fitGraph);
-    });
-    byId("layoutMode").addEventListener("change", (event) => {
-      state.view.layout = event.target.value;
-      renderGraph();
-      requestAnimationFrame(fitGraph);
-    });
-    byId("fitGraph").addEventListener("click", fitGraph);
-    byId("zoomIn").addEventListener("click", () => zoomBy(1.18));
-    byId("zoomOut").addEventListener("click", () => zoomBy(0.84));
-    byId("snapshotButton").addEventListener("click", openSnapshot);
-    byId("snapshotFormat").addEventListener("change", openSnapshot);
-    byId("closeSnapshot").addEventListener("click", () => byId("snapshotModal").classList.remove("visible"));
-    byId("snapshotModal").addEventListener("click", (event) => {
-      if (event.target === byId("snapshotModal")) byId("snapshotModal").classList.remove("visible");
-    });
-    byId("copySnapshot").addEventListener("click", async () => {
-      try {
-        await navigator.clipboard.writeText(byId("snapshotText").textContent || "");
-        byId("copySnapshot").textContent = "Copied";
-        setTimeout(() => { byId("copySnapshot").textContent = "Copy"; }, 1000);
-      } catch (_) {
-        byId("copySnapshot").textContent = "Copy failed";
-        setTimeout(() => { byId("copySnapshot").textContent = "Copy"; }, 1200);
-      }
-    });
-    byId("replayButton").addEventListener("click", startReplay);
-    byId("replayExit").addEventListener("click", exitReplay);
-    byId("replayRestart").addEventListener("click", () => {
-      state.replay.playing = true;
-      applyReplayFrame(0);
-      scheduleReplay();
-      updateReplayControls();
-    });
-    byId("replayPlayPause").addEventListener("click", () => {
-      state.replay.playing = !state.replay.playing;
-      updateReplayControls();
-      scheduleReplay();
-    });
-    byId("replaySpeed").addEventListener("change", (event) => {
-      state.replay.stepMs = Number(event.target.value) || 1100;
-      scheduleReplay();
-    });
-    document.querySelectorAll(".tab").forEach((tab) => {
-      tab.addEventListener("click", () => {
-        state.inspectorTab = tab.dataset.tab;
-        renderInspector();
-      });
-    });
-
-    bindGraphPanZoom();
-    refresh(true).then(() => requestAnimationFrame(fitGraph));
-    window.setInterval(() => refresh(false), 5000);
-    window.addEventListener("resize", () => requestAnimationFrame(fitGraph));
-  </script>
+  <script src="/static/vendor/vue.global.prod.js"></script>
+  <script src="/static/vendor/cytoscape.min.js"></script>
+  <script src="/static/vendor/dagre.min.js"></script>
+  <script src="/static/vendor/cytoscape-dagre.js"></script>
+  <script src="/static/app.js"></script>
 </body>
 </html>
