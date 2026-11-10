@@ -1,6 +1,6 @@
 .env
+.venv/
 auth.json
-rag_data/
 __pycache__/
 *.pyc
 logs/

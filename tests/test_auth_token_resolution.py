@@ -1,49 +1,68 @@
 from __future__ import annotations
 
-import json
 import os
+from pathlib import Path
 import tempfile
 import unittest
-from contextlib import contextmanager
-from pathlib import Path
 from unittest.mock import patch
 
-from rag.common import require_openai_auth_token
+from web_agent.claude_runtime import load_claude_sdk_config
 
 
-@contextmanager
-def _pushd(path: Path):
-    prev = Path.cwd()
-    os.chdir(path)
-    try:
-        yield
-    finally:
-        os.chdir(prev)
+class ClaudeConfigTests(unittest.TestCase):
+    def test_api_key_config_is_isolated_and_metadata_is_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as td, patch.dict(
+            os.environ,
+            {
+                "ANTHROPIC_API_KEY": "secret-api-key",
+                "ANTHROPIC_AUTH_TOKEN": "",
+                "ANTHROPIC_MODEL": "fixture-model",
+                "ANTHROPIC_BASE_URL": "https://gateway.example",
+            },
+            clear=True,
+        ):
+            config = load_claude_sdk_config(Path(td))
+        self.assertEqual(config.model, "fixture-model")
+        self.assertEqual(config.env["ANTHROPIC_API_KEY"], "secret-api-key")
+        self.assertEqual(config.env["ANTHROPIC_AUTH_TOKEN"], "")
+        self.assertNotIn("secret-api-key", repr(config))
+        self.assertNotIn("secret-api-key", str(config.public_metadata()))
+        self.assertNotIn("secret-api-key", config.signature())
+        self.assertIn("claude-agent-sdk", config.signature())
 
+    def test_auth_token_mode_clears_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as td, patch.dict(
+            os.environ,
+            {
+                "ANTHROPIC_API_KEY": "",
+                "ANTHROPIC_AUTH_TOKEN": "secret-token",
+                "ANTHROPIC_MODEL": "fixture-model",
+            },
+            clear=True,
+        ):
+            config = load_claude_sdk_config(Path(td))
+        self.assertEqual(config.env["ANTHROPIC_API_KEY"], "")
+        self.assertEqual(config.env["ANTHROPIC_AUTH_TOKEN"], "secret-token")
 
-class AuthTokenResolutionTests(unittest.TestCase):
-    def test_prefers_repo_auth_json_access_token(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            payload = {
-                "auth_mode": "chatgpt",
-                "tokens": {
-                    "access_token": "at_test_token",
-                },
-            }
-            (root / "auth.json").write_text(json.dumps(payload), encoding="utf-8")
-            with patch.dict(os.environ, {}, clear=False):
-                token = require_openai_auth_token(root=root)
-            self.assertEqual(token, "at_test_token")
+    def test_two_credential_modes_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as td, patch.dict(
+            os.environ,
+            {
+                "ANTHROPIC_API_KEY": "key",
+                "ANTHROPIC_AUTH_TOKEN": "token",
+                "ANTHROPIC_MODEL": "fixture-model",
+            },
+            clear=True,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "only one"):
+                load_claude_sdk_config(Path(td))
 
-    def test_rejects_api_key_when_no_access_token(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            with _pushd(root), patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test"}, clear=False):
-                with self.assertRaises(RuntimeError) as ctx:
-                    require_openai_auth_token(root=root)
-            self.assertIn("OPENAI_API_KEY is disabled by policy", str(ctx.exception))
-
+    def test_missing_explicit_credentials_does_not_fall_back_to_user_login(self) -> None:
+        with tempfile.TemporaryDirectory() as td, patch.dict(
+            os.environ, {"ANTHROPIC_MODEL": "fixture-model"}, clear=True
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Missing Claude credentials"):
+                load_claude_sdk_config(Path(td))
 
 if __name__ == "__main__":
     unittest.main()

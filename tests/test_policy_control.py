@@ -6,12 +6,15 @@ from pathlib import Path
 
 from web_agent.cmd_agent import apply_branch_shift_candidate_override
 from web_agent.solver_shared import (
+    AUTONOMY_MODES,
     classify_command_family,
     cluster_for_failure_reason,
     derive_allowed_families_for_branch_shift,
     derive_execution_monitor_policy,
     derive_gain_budget_policy,
+    evaluate_action_policy,
     merge_controller_with_gain_policy,
+    normalize_autonomy_mode,
     normalize_failure_reason,
     pathological_repeat_summary,
     validate_action,
@@ -20,6 +23,13 @@ from web_agent.solver_shared import (
 
 
 class PolicyControlTests(unittest.TestCase):
+    def test_normalize_autonomy_mode_defaults_to_adaptive(self) -> None:
+        self.assertEqual(AUTONOMY_MODES, {"adaptive", "guarded"})
+        self.assertEqual(normalize_autonomy_mode("adaptive"), "adaptive")
+        self.assertEqual(normalize_autonomy_mode(" GUARDED "), "guarded")
+        self.assertEqual(normalize_autonomy_mode(""), "adaptive")
+        self.assertEqual(normalize_autonomy_mode("unrecognized"), "adaptive")
+
     def test_failure_reason_normalization(self) -> None:
         self.assertEqual(normalize_failure_reason(""), "none")
         self.assertEqual(normalize_failure_reason("METHOD_NOT_ALLOWED"), "method_not_allowed")
@@ -46,6 +56,74 @@ class PolicyControlTests(unittest.TestCase):
             )
             self.assertFalse(ok)
             self.assertIn("Semantic error recovery", reason)
+
+    def test_adaptive_mode_allows_phase_regression_with_advisory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            memory = MemoryStore(Path(td) / "mem.sqlite", run_id="adaptive-phase")
+            memory.upsert_fact("endpoint.candidate.login", "/login", 0.9, 1)
+
+            guarded_ok, guarded_reason = validate_action(
+                phase="recon",
+                expected_phase="probe",
+                command="curl -si $TARGET_URL/robots.txt",
+                memory=memory,
+                history=[],
+                autonomy_mode="guarded",
+            )
+            adaptive = evaluate_action_policy(
+                phase="recon",
+                expected_phase="probe",
+                command="curl -si $TARGET_URL/robots.txt",
+                memory=memory,
+                history=[],
+                autonomy_mode="adaptive",
+            )
+
+            self.assertFalse(guarded_ok)
+            self.assertIn("recon should not continue", guarded_reason)
+            self.assertTrue(adaptive["ok"])
+            self.assertEqual(adaptive["reason"], "")
+            self.assertTrue(any("recon should not continue" in item for item in adaptive["advisories"]))
+
+    def test_adaptive_mode_allows_semantic_recovery_with_advisories(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            memory = MemoryStore(Path(td) / "mem.sqlite", run_id="adaptive-semantic")
+            memory.upsert_fact("error.semantic.missing_required_parameter", "true", 0.96, 1)
+            memory.upsert_fact("endpoint.focus", "/api/login", 0.90, 1)
+
+            result = evaluate_action_policy(
+                phase="probe",
+                expected_phase="probe",
+                command="curl -si $TARGET_URL/robots.txt",
+                memory=memory,
+                history=[],
+                autonomy_mode="adaptive",
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(any("Semantic error recovery" in item for item in result["advisories"]))
+            self.assertTrue(any("action must focus on /api/login" in item for item in result["advisories"]))
+
+    def test_adaptive_mode_allows_controller_family_rules_with_advisories(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            memory = MemoryStore(Path(td) / "mem.sqlite", run_id="adaptive-controller")
+            history = [{"command": "curl -si $TARGET_URL/", "returncode": 0, "info_gain": 1}]
+            result = evaluate_action_policy(
+                phase="probe",
+                expected_phase="probe",
+                command="curl -si $TARGET_URL/login",
+                memory=memory,
+                history=history,
+                controller_reflection={
+                    "failure_cluster": "low_gain_loop",
+                    "allowed_families": ["sqlmap"],
+                },
+                autonomy_mode="adaptive",
+            )
+
+            self.assertTrue(result["ok"])
+            self.assertTrue(any("repeated command family" in item for item in result["advisories"]))
+            self.assertTrue(any("allowed set" in item for item in result["advisories"]))
 
     def test_validate_action_blocks_non_focused_command_under_missing_parameter(self) -> None:
         with tempfile.TemporaryDirectory() as td:

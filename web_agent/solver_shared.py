@@ -71,6 +71,15 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
             "content_type": "--content-type",
         },
     },
+    "extract_html_attack_surface": {
+        "script": "$PROJECT_ROOT/scripts/extract_html_attack_surface.py",
+        "required": ["html_file", "base_url", "out"],
+        "arg_map": {
+            "html_file": "--html-file",
+            "base_url": "--base-url",
+            "out": "--out",
+        },
+    },
     "cookiejar_flow_fetch": {
         "script": "$PROJECT_ROOT/scripts/cookiejar_flow_fetch.py",
         "required": ["base_url", "cookiejar", "fetch_url"],
@@ -138,6 +147,7 @@ ACTION_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 ACTION_PHASE_HINTS: dict[str, str] = {
     "http_probe_with_baseline": "recon",
+    "extract_html_attack_surface": "extract",
     "cookiejar_flow_fetch": "probe",
     "service_recovery_probe": "probe",
     "multipart_upload_with_known_action": "exploit",
@@ -154,6 +164,8 @@ FAILURE_CLUSTERS = {
     "hypothesis_stale",
     "execution_error",
 }
+
+AUTONOMY_MODES = {"adaptive", "guarded"}
 
 FAILURE_REASONS = {
     "none",
@@ -198,6 +210,11 @@ def normalize_failure_reason(reason: str) -> str:
 def cluster_for_failure_reason(reason: str) -> str:
     normalized = normalize_failure_reason(reason)
     return FAILURE_REASON_TO_CLUSTER.get(normalized, "none")
+
+
+def normalize_autonomy_mode(raw: str) -> str:
+    mode = str(raw or "").strip().lower()
+    return mode if mode in AUTONOMY_MODES else "adaptive"
 
 
 ControllerRule = Callable[..., str | None]
@@ -757,6 +774,15 @@ def action_defaults(name: str, memory: MemoryStore) -> dict[str, str]:
             "method": "GET",
             "baseline_url": target,
             "timeout": "15",
+        }
+    if name == "extract_html_attack_surface":
+        target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
+        artifact_dir = memory.get_fact("artifact.dir") or "$AGENT_ARTIFACT_DIR"
+        html_file = memory.get_fact("artifact.html_file") or str(Path(artifact_dir) / "root.body")
+        return {
+            "html_file": html_file,
+            "base_url": target,
+            "out": str(Path(artifact_dir) / "html_attack_surface.json"),
         }
     if name == "cookiejar_flow_fetch":
         target = (memory.get_fact("target") or "$TARGET_URL").rstrip("/")
@@ -2132,7 +2158,7 @@ def merge_controller_with_gain_policy(
     return out
 
 
-def soften_controller_for_codex(controller_reflection: dict[str, Any]) -> dict[str, Any]:
+def soften_controller_for_claude(controller_reflection: dict[str, Any]) -> dict[str, Any]:
     policy = dict(controller_reflection or {})
     requirements = policy.get("requirements", {}) if isinstance(policy.get("requirements"), dict) else {}
     return {
@@ -2260,7 +2286,7 @@ CONTROLLER_VALIDATION_RULES: tuple[ControllerRule, ...] = (
 )
 
 
-def validate_action(
+def evaluate_action_policy(
     phase: str,
     expected_phase: str,
     command: str,
@@ -2268,7 +2294,16 @@ def validate_action(
     history: list[dict[str, Any]],
     controller_reflection: dict[str, Any] | None = None,
     action_name: str = "",
-) -> tuple[bool, str]:
+    autonomy_mode: str = "adaptive",
+) -> dict[str, Any]:
+    mode = normalize_autonomy_mode(autonomy_mode)
+    reasons: list[str] = []
+
+    def add_reason(reason: str | None) -> None:
+        value = str(reason or "").strip()
+        if value and value not in reasons:
+            reasons.append(value)
+
     cmd = command.lower()
     command_action = canonical_action_name(action_name) or infer_action_name_from_command(command)
     focus_endpoint = (memory.get_fact("endpoint.focus") or memory.get_fact("endpoint.last") or "").strip().lower()
@@ -2284,9 +2319,9 @@ def validate_action(
     has_candidate_entrypoints = memory.has_prefix("entrypoint.candidate.") or memory.has_prefix("endpoint.candidate.")
     critical_structured = command_action in {"service_recovery_probe"}
     if expected_phase == "probe" and phase == "recon" and has_candidate_entrypoints and not critical_structured:
-        return False, "Known entrypoint candidates exist; recon should not continue."
+        add_reason("Known entrypoint candidates exist; recon should not continue.")
     if expected_phase in {"exploit", "extract"} and phase == "recon" and not critical_structured:
-        return False, "A stronger signal exists; recon is no longer the best action."
+        add_reason("A stronger signal exists; recon is no longer the best action.")
     if (
         is_http_target
         and has_frontend_artifact
@@ -2294,19 +2329,19 @@ def validate_action(
         and not critical_structured
         and not (has_frontend_snapshot and has_request_semantics)
     ):
-        return False, "Exploit blocked: observe frontend and extract request semantics first."
+        add_reason("Exploit blocked: observe frontend and extract request semantics first.")
     if has_candidate_entrypoints and "sed -n" in cmd and "/tmp/index.html" in cmd:
-        return False, "Re-reading the same page is low information gain after parameters are known."
+        add_reason("Re-reading the same page is low information gain after parameters are known.")
     if phase in {"exploit", "extract"} and not critical_structured and not (
         memory.has_prefix("entrypoint.confirmed.") or memory.has_prefix("vuln.signal.")
     ):
         if memory.get_fact("debug.traceback_exposed") != "true" and memory.get_fact("auth.basic.valid") != "true":
-            return False, "Exploit/extract requires a confirmed entrypoint or vulnerability signal."
+            add_reason("Exploit/extract requires a confirmed entrypoint or vulnerability signal.")
     if history and "skipped-duplicate-command" in str(history[-1].get("signal", "")):
-        return False, "Previous action was duplicate-like; choose a materially different command."
+        add_reason("Previous action was duplicate-like; choose a materially different command.")
     repeat_guard_reason = repeated_command_guard_reason(command, history, memory)
     if repeat_guard_reason:
-        return False, repeat_guard_reason
+        add_reason(repeat_guard_reason)
     semantic_rule_ctx = {
         "cmd": cmd,
         "command_action": command_action,
@@ -2316,9 +2351,7 @@ def validate_action(
         "focus_endpoint": focus_endpoint,
     }
     for rule in SEMANTIC_VALIDATION_RULES:
-        reason = rule(**semantic_rule_ctx)
-        if reason:
-            return False, reason
+        add_reason(rule(**semantic_rule_ctx))
 
     # Hard constraints from controller reflection (policy layer).
     policy = controller_reflection or {}
@@ -2345,10 +2378,46 @@ def validate_action(
         "previous_gain": previous_gain,
     }
     for rule in CONTROLLER_VALIDATION_RULES:
-        reason = rule(**rule_ctx)
-        if reason:
-            return False, reason
-    return True, ""
+        add_reason(rule(**rule_ctx))
+
+    if mode == "guarded" and reasons:
+        return {
+            "ok": False,
+            "reason": reasons[0],
+            "advisories": reasons[1:],
+            "reasons": reasons,
+            "autonomy_mode": mode,
+        }
+    return {
+        "ok": True,
+        "reason": "",
+        "advisories": reasons,
+        "reasons": reasons,
+        "autonomy_mode": mode,
+    }
+
+
+def validate_action(
+    phase: str,
+    expected_phase: str,
+    command: str,
+    memory: MemoryStore,
+    history: list[dict[str, Any]],
+    controller_reflection: dict[str, Any] | None = None,
+    action_name: str = "",
+    autonomy_mode: str = "guarded",
+) -> tuple[bool, str]:
+    result = evaluate_action_policy(
+        phase=phase,
+        expected_phase=expected_phase,
+        command=command,
+        memory=memory,
+        history=history,
+        controller_reflection=controller_reflection,
+        action_name=action_name,
+        autonomy_mode=autonomy_mode,
+    )
+    return bool(result["ok"]), str(result["reason"])
 
 
 def reflection_summary(memory: MemoryStore, max_items: int = 8) -> str:
@@ -2765,6 +2834,33 @@ def recent_observations(history: list[dict[str, Any]], limit: int = 5) -> str:
         out = str(h.get("stdout_head", "")).replace("\n", "\\n")[:260]
         err = str(h.get("stderr_head", "")).replace("\n", "\\n")[:180]
         rows.append(f"cmd={cmd} rc={rc} signal={sig} out={out} err={err}")
+    return "\n".join(rows)
+
+
+def short_history(history: list[dict[str, Any]], limit: int = 8) -> str:
+    if not history:
+        return "none"
+    rows: list[str] = []
+    for item in history[-limit:]:
+        step = item.get("step", "")
+        phase = str(item.get("phase", ""))
+        if item.get("action") == "fuzz":
+            rows.append(
+                f"step={step} phase={phase} action=fuzz "
+                f"tested={item.get('tested', 0)} "
+                f"best={str(item.get('best_signal', 'none'))[:80]}"
+            )
+            continue
+        command = str(item.get("command", ""))[:120]
+        status = item.get("status", item.get("returncode", 0))
+        url = str(item.get("url", ""))
+        signal = str(item.get("signal", ""))[:120]
+        row = f"step={step} phase={phase} status={status}"
+        if command:
+            row += f" command={command}"
+        if url:
+            row += f" url={url}"
+        rows.append(f"{row} signal={signal}")
     return "\n".join(rows)
 
 

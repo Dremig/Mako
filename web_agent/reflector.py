@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from rag.common import json_completion
+from web_agent.claude_runtime import ClaudeSDKConfig, json_completion
 from web_agent.solver_shared import FAILURE_CLUSTERS, MemoryStore, normalize_failure_reason
 
 STRICT_JSON_RULES = (
@@ -29,9 +29,7 @@ REFLECTOR_SCHEMA: dict[str, Any] = {
 
 def run_reflector_policy(
     *,
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     step: int,
     target: str,
     objective: str,
@@ -68,9 +66,7 @@ def run_reflector_policy(
     for attempt in range(1, 4):
         try:
             parsed = json_completion(
-                base_url=base_url,
-                api_key=api_key,
-                model=model,
+                config=sdk_config,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 json_schema_name="reflector_policy",
@@ -234,9 +230,7 @@ def repair_controller_policy(
 def run_reflector_worker(
     *,
     step: int,
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     target: str,
     objective: str,
     expected_phase: str,
@@ -248,9 +242,7 @@ def run_reflector_worker(
     history: list[dict[str, Any]],
 ) -> dict[str, Any]:
     raw = run_reflector_policy(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
+        sdk_config=sdk_config,
         step=step,
         target=target,
         objective=objective,

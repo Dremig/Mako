@@ -13,7 +13,7 @@ It records the key ideas that matter for the current agent iteration.
 2. The architecture should stay split into interpreter + planner + deliberation + shared runtime.
 - Interpreter provides priors and route ordering.
 - Planner turns priors into explicit subtasks.
-- Recommender/corrector/judge execute one subtask at a time.
+- A primary Claude tactical solver executes one subtask at a time; adversarial review is optional.
 - Capability management resolves what is missing before execution.
 - Logistics is the support branch that performs environment setup, helper generation, and tool supplementation.
 - Shared memory is the control surface across steps.
@@ -37,7 +37,7 @@ It records the key ideas that matter for the current agent iteration.
 
 6. Information gain should gate actions.
 - Avoid repeating commands with low new evidence.
-- Force action-family changes after repeated low-gain or timeout loops.
+- Recommend action-family changes early; force them only after a hard, measurable low-gain or timeout breach.
 
 7. Entry-point extraction must remain conservative.
 - False parameters pollute memory and break downstream planning.
@@ -53,7 +53,8 @@ It records the key ideas that matter for the current agent iteration.
 ```text
 task_interpreter
   -> planner
-  -> recommender / corrector / judge
+  -> Claude tactical solver
+  -> optional counter-solver / corrector
   -> capability
   -> logistics
   -> executor
@@ -63,6 +64,7 @@ task_interpreter
 ```
 
 - `planner` owns the explicit subtask list.
+- In adaptive mode that list is advisory; Claude owns the concrete route and action.
 - `reflector` changes plan state, not just next-command wording.
 - `capability` decides what support is missing.
 - `logistics` performs the support work without consuming challenge-step budget.
@@ -81,10 +83,10 @@ task_interpreter
   - or the agent stays in recon/probe too long without changing evidence type
 - Current behavior:
   - write repeat state into memory as `repeat_guard.*`
-  - inject repeat constraints into planner/tactical context
-  - block another action when it is just the same semantic probe again
+  - inject repeat advice into planner/tactical context
+  - block only in `guarded` mode or after a hard zero-gain circuit-breaker threshold
 - Current intent:
-  - do not override Codex route choice semantically
+  - do not override Claude route choice semantically
   - do cut off cheap local loops that only rephrase the same probe
   - force the next step to change one of:
     - target surface

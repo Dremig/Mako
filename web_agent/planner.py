@@ -6,7 +6,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from rag.common import json_completion
+from web_agent.claude_runtime import ClaudeSDKConfig, json_completion
 from web_agent.solver_shared import MemoryStore, available_action_names
 
 STRICT_JSON_RULES = (
@@ -47,8 +47,8 @@ PLAN_SCHEMA: dict[str, Any] = {
 
 
 @lru_cache(maxsize=1)
-def runtime_codex_contract_text() -> str:
-    path = Path(__file__).resolve().parents[1] / "docs" / "runtime_codex_contract.md"
+def runtime_claude_contract_text() -> str:
+    path = Path(__file__).resolve().parents[1] / "docs" / "runtime_claude_contract.md"
     try:
         text = path.read_text(encoding="utf-8").strip()
     except Exception:
@@ -105,7 +105,7 @@ def fallback_plan(memory: MemoryStore) -> dict[str, Any]:
             "goal": f"Collect one stable baseline response from {target}",
             "success_signal": "status line, headers, and body saved under artifact dir",
             "suggested_action": "http_probe_with_baseline",
-            "discussion": "Start with a deterministic baseline fetch so Codex can reason from real headers, body, redirects, and cookies instead of guessing routes.",
+            "discussion": "Start with a deterministic baseline fetch so Claude can reason from real headers, body, redirects, and cookies instead of guessing routes.",
             "open_questions": ["Does the root page expose forms, redirects, or identity hints?"],
             "status": "pending",
         }
@@ -147,7 +147,7 @@ def fallback_plan(memory: MemoryStore) -> dict[str, Any]:
                 "goal": f"Validate controllability of {endpoint_focus}",
                 "success_signal": "new status, params, methods, or form fields discovered on focused endpoint",
                 "suggested_action": "",
-                "discussion": "Treat the focused endpoint as a candidate, not a command. Codex should decide whether it is truly higher value than other confirmed auth-relevant routes.",
+                "discussion": "Treat the focused endpoint as a candidate, not a command. Claude should decide whether it is truly higher value than other confirmed auth-relevant routes.",
                 "open_questions": [f"Is {endpoint_focus} truly the best next target?"],
                 "status": "pending",
             }
@@ -174,9 +174,7 @@ def fallback_plan(memory: MemoryStore) -> dict[str, Any]:
 
 def run_plan_worker(
     *,
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     target: str,
     objective: str,
     hint: str,
@@ -190,15 +188,15 @@ def run_plan_worker(
     history_text: str,
     recent_obs: str,
     memory: MemoryStore,
-    response_context: dict[str, Any] | None = None,
+    session_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    contract_text = runtime_codex_contract_text()
+    contract_text = runtime_claude_contract_text()
     contract_prefix = f"{contract_text}\n\n" if contract_text else ""
     system_prompt = (
         "You are a planning layer for a command-driven CTF agent.\n"
         "Produce a short ordered plan of subtasks before command execution.\n"
         "The plan should be explicit enough that a solver can discuss and execute one subtask at a time.\n"
-        "You are not issuing hard commands. You are preparing advisory context for Codex.\n"
+        "You are not issuing hard commands. You are preparing advisory context for Claude.\n"
         f"{contract_prefix}"
         "Prefer structured actions when they directly match the subtask goal.\n"
         "Use `service_recovery_probe` when HTTP responses are empty, protocol-mismatched, or unstable.\n"
@@ -228,15 +226,13 @@ def run_plan_worker(
     for attempt in range(1, 4):
         try:
             parsed = json_completion(
-                base_url=base_url,
-                api_key=api_key,
-                model=model,
+                config=sdk_config,
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 json_schema_name="planner_payload",
                 json_schema=PLAN_SCHEMA,
                 temperature=0.1,
-                response_context=response_context,
+                session_context=session_context,
             )
             break
         except Exception:
@@ -325,7 +321,7 @@ def build_plan_patch(
                 "goal": "Turn discovered input names into a controllable request surface",
                 "success_signal": "server returns parameter validation, next stage, or parser error",
                 "suggested_action": "",
-                "discussion": "Codex should prefer real observed forms or parameters over generic route guessing.",
+                "discussion": "Claude should prefer real observed forms or parameters over generic route guessing.",
                 "open_questions": ["Which observed input surface is the highest-value one to submit first?"],
             }
         )

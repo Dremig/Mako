@@ -4,7 +4,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from rag.common import json_completion
+from web_agent.claude_runtime import ClaudeSDKConfig, json_completion
 from web_agent.solver_shared import strip_noise
 
 STRICT_JSON_RULES = (
@@ -66,9 +66,7 @@ def _build_install_command(target: str, *, prefer_python: bool) -> str:
 
 def run_logistics_decider(
     *,
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     capability: dict[str, Any],
     available_tools: dict[str, str],
     memory_summary: str,
@@ -101,9 +99,7 @@ def run_logistics_decider(
     )
     try:
         parsed = json_completion(
-            base_url=base_url,
-            api_key=api_key,
-            model=model,
+            config=sdk_config,
             system_prompt=prompt,
             user_prompt=user,
             json_schema_name="logistics_decision",

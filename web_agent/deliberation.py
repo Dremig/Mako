@@ -5,7 +5,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable
 
-from rag.common import json_completion
+from web_agent.claude_runtime import ClaudeSDKConfig, json_completion
 from web_agent.solver_shared import available_action_names
 
 STRICT_JSON_RULES = (
@@ -80,8 +80,8 @@ COUNTER_SOLVER_SCHEMA: dict[str, Any] = {
 
 
 @lru_cache(maxsize=1)
-def runtime_codex_contract_text() -> str:
-    path = Path(__file__).resolve().parents[1] / "docs" / "runtime_codex_contract.md"
+def runtime_claude_contract_text() -> str:
+    path = Path(__file__).resolve().parents[1] / "docs" / "runtime_claude_contract.md"
     try:
         text = path.read_text(encoding="utf-8").strip()
     except Exception:
@@ -125,29 +125,25 @@ def _normalize_proposal_payload(raw: dict[str, Any]) -> dict[str, Any]:
 
 def _run_json_model(
     *,
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     system_prompt: str,
     user_prompt: str,
     json_schema_name: str,
     json_schema: dict[str, Any],
     temperature: float,
-    response_context: dict[str, Any] | None = None,
+    session_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     last_error = ""
     for attempt in range(1, 4):
         try:
             return json_completion(
-                base_url=base_url,
-                api_key=api_key,
-                model=model,
+                config=sdk_config,
                 system_prompt=system_prompt + "\n" + STRICT_JSON_RULES,
                 user_prompt=user_prompt,
                 json_schema_name=json_schema_name,
                 json_schema=json_schema,
                 temperature=temperature,
-                response_context=response_context,
+                session_context=session_context,
             )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {str(exc)[:260]}"
@@ -158,23 +154,19 @@ def _run_json_model(
 
 def run_recommender(
     *,
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     system_prompt: str,
     user_prompt: str,
-    response_context: dict[str, Any] | None = None,
+    session_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     parsed = _run_json_model(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
+        sdk_config=sdk_config,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         json_schema_name="deliberation_payload",
         json_schema=PROPOSAL_SCHEMA,
         temperature=0.2,
-        response_context=response_context,
+        session_context=session_context,
     )
     if not parsed:
         return _fallback_proposal()
@@ -183,9 +175,7 @@ def run_recommender(
 
 def run_corrector(
     *,
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     target: str,
     step: int,
     active_title: str,
@@ -198,7 +188,7 @@ def run_corrector(
     memory_summary: str,
     recent_history: str,
     counter_solver_notes: dict[str, Any] | None = None,
-    response_context: dict[str, Any] | None = None,
+    session_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     system_prompt = (
         "You are a sabotager-style corrector for a CTF execution agent.\n"
@@ -242,15 +232,13 @@ def run_corrector(
         f"Recommender proposal:\n{recommender}\n"
     )
     parsed = _run_json_model(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
+        sdk_config=sdk_config,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         json_schema_name="corrector_payload",
         json_schema=CORRECTOR_SCHEMA,
         temperature=0.1,
-        response_context=response_context,
+        session_context=session_context,
     )
     verdict = str(parsed.get("verdict", "accept")).strip().lower() or "accept"
     corrected = parsed.get("corrected", recommender)
@@ -274,6 +262,7 @@ def choose_final_proposal(
     corrector: dict[str, Any],
     active_action: str,
     counter_solver: dict[str, Any] | None = None,
+    enforce_planner_action: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     verdict = str(corrector.get("verdict", "accept")).strip().lower()
     corrected = corrector.get("corrected", recommender)
@@ -315,8 +304,11 @@ def choose_final_proposal(
                 "decision": "accept_counter_challenge",
                 "reason": "counter-solver requested route challenge and corrector produced a materially different test",
             }
-    if active_action and active_action in ACTION_NAMES:
+    if enforce_planner_action and active_action and active_action in ACTION_NAMES:
         chosen, judge = force_planner_action_hint(chosen=chosen, active_action=active_action, base_judge=judge)
+    elif active_action and active_action in ACTION_NAMES:
+        judge = dict(judge)
+        judge["reason"] = f"{judge.get('reason', '')}; adaptive autonomy kept planner action advisory".strip("; ")
     return chosen, judge
 
 
@@ -346,9 +338,7 @@ def force_planner_action_hint(
 
 def run_counter_solver(
     *,
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     target: str,
     objective: str,
     step: int,
@@ -358,8 +348,7 @@ def run_counter_solver(
     hypotheses_text: str,
     recent_history: str,
     recent_obs: str,
-    retrieved_context: str,
-    response_context: dict[str, Any] | None = None,
+    session_context: dict[str, Any] | None = None,
     trace_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     system_prompt = (
@@ -390,21 +379,18 @@ def run_counter_solver(
         f"Persistent memory facts:\n{memory_summary}\n\n"
         f"Hypotheses:\n{hypotheses_text}\n\n"
         f"Recent history:\n{recent_history}\n\n"
-        f"Recent observations:\n{recent_obs}\n\n"
-        f"Retrieved context:\n{retrieved_context}\n"
+        f"Recent observations:\n{recent_obs}\n"
     )
     if trace_hook is not None:
         trace_hook({"kind": "counter_prompt", "system_prompt": system_prompt, "user_prompt": user_prompt})
     parsed = _run_json_model(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
+        sdk_config=sdk_config,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         json_schema_name="counter_solver_payload",
         json_schema=COUNTER_SOLVER_SCHEMA,
         temperature=0.1,
-        response_context=response_context,
+        session_context=session_context,
     )
     out = parsed if isinstance(parsed, dict) else {}
     if trace_hook is not None:
@@ -424,9 +410,7 @@ def run_counter_solver(
 
 def run_tactical_solver(
     *,
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     target: str,
     objective: str,
     step: int,
@@ -450,13 +434,12 @@ def run_tactical_solver(
     actions_text: str,
     recent_history: str,
     recent_obs: str,
-    retrieved_context: str,
     counter_solver_notes: dict[str, Any] | None = None,
     collab_mode: bool = False,
-    response_context: dict[str, Any] | None = None,
+    session_context: dict[str, Any] | None = None,
     trace_hook: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    contract_text = runtime_codex_contract_text()
+    contract_text = runtime_claude_contract_text()
     contract_prefix = f"{contract_text}\n\n" if contract_text else ""
     if collab_mode:
         system_prompt = (
@@ -547,8 +530,7 @@ def run_tactical_solver(
         f"Recent history:\n{recent_history}\n\n"
         f"Recent observations:\n{recent_obs}\n\n"
         f"Counter-solver notes:\n{json.dumps(counter_solver_notes or {}, ensure_ascii=False)}\n\n"
-        "If counter-solver notes include a cheap falsification test, prefer executing that discriminator before deeper exploitation unless runtime evidence already falsified it.\n\n"
-        f"Retrieved context:\n{retrieved_context}\n"
+        "If counter-solver notes include a cheap falsification test, prefer executing that discriminator before deeper exploitation unless runtime evidence already falsified it.\n"
     )
     if trace_hook is not None:
         trace_hook(
@@ -560,15 +542,13 @@ def run_tactical_solver(
             }
         )
     parsed = _run_json_model(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
+        sdk_config=sdk_config,
         system_prompt=system_prompt,
         user_prompt=user_prompt,
         json_schema_name="tactical_payload",
         json_schema=PROPOSAL_SCHEMA,
         temperature=0.15,
-        response_context=response_context,
+        session_context=session_context,
     )
     chosen = _normalize_proposal_payload(parsed) if parsed else _fallback_proposal()
     if trace_hook is not None:
@@ -580,4 +560,4 @@ def run_tactical_solver(
                 "collab_mode": collab_mode,
             }
         )
-    return chosen, {"decision": "accept_tactical", "reason": "single-pass codex tactical solver"}
+    return chosen, {"decision": "accept_tactical", "reason": "single-pass Claude tactical solver"}

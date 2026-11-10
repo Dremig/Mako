@@ -14,9 +14,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from rag.agent import hybrid_retrieve, load_index, short_history
-from rag.common import chat_completion, load_dotenv, require_openai_auth_token
 from web_agent.capability import resolve_capability_gap
+from web_agent.claude_runtime import (
+    ClaudeSDKConfig,
+    chat_completion,
+    load_claude_sdk_config,
+    load_dotenv,
+)
 from web_agent.deliberation import choose_final_proposal, run_corrector, run_counter_solver, run_recommender, run_tactical_solver
 from web_agent.logistics import build_logistics_request, perform_logistics_request, run_logistics_decider
 from web_agent.planner import (
@@ -37,6 +41,7 @@ from web_agent.solver_shared import (
     derive_allowed_families_for_branch_shift,
     derive_execution_monitor_policy,
     derive_gain_budget_policy,
+    evaluate_action_policy,
     FLAG_RE,
     MemoryStore,
     derive_phase_state,
@@ -47,6 +52,7 @@ from web_agent.solver_shared import (
     hint_summary,
     info_gain_score,
     normalize_command,
+    normalize_autonomy_mode,
     pathological_repeat_summary,
     preflight_command_quality,
     repair_helper_command,
@@ -56,13 +62,13 @@ from web_agent.solver_shared import (
     reflect_step,
     merge_controller_with_gain_policy,
     run_shell_command,
-    soften_controller_for_codex,
+    short_history,
+    soften_controller_for_claude,
     strip_noise,
     summarize_allowed_families,
     suggested_phase_for_action,
     task_prior_summary,
     update_hypotheses,
-    validate_action,
     validate_action_spec,
     validate_command,
 )
@@ -77,9 +83,30 @@ def _env_truthy(name: str) -> bool:
     return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _debate_enabled_default_true() -> bool:
-    raw = os.getenv("OPENAI_FORCE_DEBATE", "true").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
+def debate_enabled(solver_mode: str, requested: bool) -> bool:
+    """Collaboration always debates; other Claude modes require an explicit opt-in."""
+    return str(solver_mode).strip().lower() == "claude_collab" or bool(requested)
+
+
+def branch_shift_enforcement(
+    autonomy_mode: str,
+    gain_policy: dict[str, Any],
+    monitor_policy: dict[str, Any],
+) -> str:
+    """Return ``none``, ``advisory``, or ``hard`` for a requested branch shift."""
+    gain_requirements = gain_policy.get("requirements", {}) if isinstance(gain_policy.get("requirements"), dict) else {}
+    monitor_requirements = monitor_policy.get("requirements", {}) if isinstance(monitor_policy.get("requirements"), dict) else {}
+    gain_requested = bool(gain_requirements.get("force_branch_shift", False))
+    monitor_requested = bool(monitor_requirements.get("force_branch_shift", False))
+    if not (gain_requested or monitor_requested):
+        return "none"
+    if normalize_autonomy_mode(autonomy_mode) == "guarded":
+        return "hard"
+    if gain_requested and str(gain_policy.get("severity", "")).strip().lower() == "hard":
+        return "hard"
+    if monitor_requested and str(monitor_policy.get("severity", "")).strip().lower() == "hard":
+        return "hard"
+    return "advisory"
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -95,7 +122,7 @@ def append_jsonl(path: Path, payload: dict[str, Any]) -> None:
         f.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def empty_response_contexts() -> dict[str, dict[str, Any]]:
+def empty_session_contexts() -> dict[str, dict[str, Any]]:
     return {
         "planner": {},
         "counter_solver": {},
@@ -106,8 +133,8 @@ def empty_response_contexts() -> dict[str, dict[str, Any]]:
     }
 
 
-def normalize_response_contexts(raw: Any) -> dict[str, dict[str, Any]]:
-    base = empty_response_contexts()
+def normalize_session_contexts(raw: Any) -> dict[str, dict[str, Any]]:
+    base = empty_session_contexts()
     if not isinstance(raw, dict):
         return base
     for role in list(base.keys()):
@@ -116,36 +143,32 @@ def normalize_response_contexts(raw: Any) -> dict[str, dict[str, Any]]:
     return base
 
 
-def load_response_contexts_from_run_state(
+def load_session_contexts_from_run_state(
     path: Path,
     *,
     target: str,
-    base_url: str,
-    model: str,
+    sdk_signature: str,
 ) -> dict[str, dict[str, Any]]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        return empty_response_contexts()
+        return empty_session_contexts()
     if not isinstance(data, dict):
-        return empty_response_contexts()
+        return empty_session_contexts()
     prior_target = str(data.get("target", "")).strip()
-    prior_base_url = str(data.get("base_url", "")).strip()
-    prior_model = str(data.get("model", "")).strip()
-    if prior_target != target or prior_base_url != base_url or prior_model != model:
-        return empty_response_contexts()
-    return normalize_response_contexts(data.get("response_contexts", {}))
+    prior_sdk_signature = str(data.get("sdk_signature", "")).strip()
+    if prior_target != target or prior_sdk_signature != sdk_signature:
+        return empty_session_contexts()
+    return normalize_session_contexts(data.get("session_contexts", {}))
 
 
 def summarize_run(
-    base_url: str,
-    api_key: str,
-    model: str,
+    sdk_config: ClaudeSDKConfig,
     target: str,
     objective: str,
     history: list[dict[str, Any]],
     found_flag: str,
-    response_context: dict[str, Any] | None = None,
+    session_context: dict[str, Any] | None = None,
 ) -> str:
     prompt = (
         "Summarize this command-driven CTF run.\n"
@@ -158,12 +181,10 @@ def summarize_run(
         f"History JSON:\n{json.dumps(history, ensure_ascii=False)}\n"
     )
     return chat_completion(
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
+        config=sdk_config,
         messages=[{"role": "system", "content": prompt}, {"role": "user", "content": content}],
         temperature=0.1,
-        response_context=response_context,
+        session_context=session_context,
     )
 
 
@@ -398,14 +419,7 @@ def run_interpreter_worker(
     *,
     enabled: bool,
     step: int,
-    base_url: str,
-    api_key: str,
-    model: str,
-    docs: list[dict[str, Any]],
-    top_k: int,
-    mode: str,
-    alpha: float,
-    embed_model: str,
+    sdk_config: ClaudeSDKConfig,
     target: str,
     objective: str,
     hint: str,
@@ -417,14 +431,7 @@ def run_interpreter_worker(
         return {}
     prior = run_task_interpreter(
         step=step,
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        docs=docs,
-        top_k=top_k,
-        mode=mode,
-        alpha=alpha,
-        embed_model=embed_model,
+        sdk_config=sdk_config,
         target=target,
         objective=objective,
         hint=hint,
@@ -501,7 +508,7 @@ class QueueWorkerOrchestrator:
 
 def main() -> None:
     counter_session_reset_default = 8
-    counter_session_reset_raw = os.getenv("OPENAI_COUNTER_SESSION_RESET_STEPS", "").strip()
+    counter_session_reset_raw = os.getenv("CLAUDE_COUNTER_SESSION_RESET_STEPS", "").strip()
     if counter_session_reset_raw:
         try:
             counter_session_reset_default = int(counter_session_reset_raw)
@@ -509,29 +516,25 @@ def main() -> None:
             counter_session_reset_default = 8
     counter_session_reset_default = max(0, min(counter_session_reset_default, 100))
     local_msgchain_default = True
-    local_msgchain_raw = os.getenv("OPENAI_LOCAL_MSGCHAIN", "").strip()
+    local_msgchain_raw = os.getenv("CLAUDE_LOCAL_MSGCHAIN", "").strip()
     if local_msgchain_raw:
         local_msgchain_default = local_msgchain_raw.lower() in {"1", "true", "yes", "on"}
 
-    parser = argparse.ArgumentParser(description="Codex-style command agent for blackbox CTF web challenges")
+    parser = argparse.ArgumentParser(description="Claude Agent SDK command agent for blackbox CTF web challenges")
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--env", type=Path, default=Path(".env"))
-    parser.add_argument("--index", type=Path, default=Path("rag_data/index.jsonl"))
     parser.add_argument("--target", type=str, required=True)
     parser.add_argument("--objective", type=str, default="Find SQL injection and retrieve flag")
     parser.add_argument("--hint", type=str, default="blackbox web SQL injection challenge")
     parser.add_argument("--max-steps", type=int, default=12)
     parser.add_argument("--cmd-timeout", type=int, default=25)
-    parser.add_argument("--top-k", type=int, default=8)
-    parser.add_argument("--mode", type=str, default="hybrid", choices=["dense", "bm25", "hybrid"])
-    parser.add_argument("--alpha", type=float, default=0.65)
     parser.add_argument("--max-substeps-per-node", type=int, default=4)
     parser.add_argument("--min-node-info-gain", type=float, default=8.0)
     parser.add_argument("--max-tool-calls-per-run", type=int, default=80)
     parser.add_argument(
         "--execution-monitor-enabled",
         action="store_true",
-        default=_env_truthy("OPENAI_EXECUTION_MONITOR_ENABLED"),
+        default=_env_truthy("CLAUDE_EXECUTION_MONITOR_ENABLED"),
         help="Enable execution monitor thresholds that trigger forced replan/branch shift.",
     )
     parser.add_argument(
@@ -542,46 +545,53 @@ def main() -> None:
     )
     parser.add_argument("--execution-monitor-same-family-limit", type=int, default=4)
     parser.add_argument("--execution-monitor-total-call-limit", type=int, default=10)
-    parser.add_argument(
-        "--disable-rag",
-        action="store_true",
-        default=_env_truthy("OPENAI_DISABLE_RAG"),
-        help="Disable retrieval context completely (no index loading, no embeddings).",
-    )
-    parser.add_argument(
-        "--enable-rag",
-        action="store_false",
-        dest="disable_rag",
-        help="Enable retrieval context explicitly.",
-    )
     parser.add_argument("--memory-db", type=Path, default=Path("logs/agent_memory.sqlite"))
     parser.add_argument("--run-id", type=str, default="")
     parser.add_argument("--out", type=Path, default=Path("logs/cmd_agent_last_run.json"))
     parser.add_argument("--artifact-dir", type=Path, default=Path("artifacts/cmd_agent"))
     parser.add_argument(
-        "--resume-response-context",
+        "--resume-session-context",
         action="store_true",
         default=True,
-        help="Resume previous_response_id chains from logs/cmd_agent_last_run.json when metadata matches.",
+        help="Resume Claude SDK session IDs from logs/cmd_agent_last_run.json when metadata matches.",
     )
     parser.add_argument(
-        "--no-resume-response-context",
+        "--no-resume-session-context",
         action="store_false",
-        dest="resume_response_context",
-        help="Start with fresh Responses contexts instead of resuming the last matching run.",
+        dest="resume_session_context",
+        help="Start with fresh Claude SDK sessions instead of resuming the last matching run.",
     )
     parser.add_argument("--worker-mode", type=str, default="threaded", choices=["threaded", "sync"])
     parser.add_argument(
         "--counter-session-reset-steps",
         type=int,
         default=counter_session_reset_default,
-        help="Reset counter-solver Responses session after N successful turns (0 to disable).",
+        help="Reset the counter-solver Claude SDK session after N successful turns (0 to disable).",
     )
     parser.add_argument(
         "--solver-mode",
         type=str,
-        default=os.getenv("OPENAI_SOLVER_MODE", "codex").strip().lower() or "codex",
-        choices=["codex", "codex_pure", "codex_collab", "legacy"],
+        default=os.getenv("CLAUDE_SOLVER_MODE", "claude").strip().lower() or "claude",
+        choices=["claude", "claude_pure", "claude_collab", "legacy"],
+    )
+    parser.add_argument(
+        "--autonomy-mode",
+        type=str,
+        default=normalize_autonomy_mode(os.getenv("MAKO_AUTONOMY_MODE", "adaptive")),
+        choices=["adaptive", "guarded"],
+        help="Use advisory semantic policies (adaptive) or blocking semantic policies (guarded).",
+    )
+    parser.add_argument(
+        "--force-debate",
+        action="store_true",
+        default=_env_truthy("CLAUDE_FORCE_DEBATE"),
+        help="Run the counter-solver and corrector around the tactical Claude step.",
+    )
+    parser.add_argument(
+        "--no-force-debate",
+        action="store_false",
+        dest="force_debate",
+        help="Use a single tactical Claude pass (claude_collab always debates).",
     )
     parser.add_argument(
         "--local-msgchain",
@@ -596,15 +606,11 @@ def main() -> None:
         help="Disable local replay message chains and rely on provider-side session chaining when available.",
     )
     args = parser.parse_args()
+    args.autonomy_mode = normalize_autonomy_mode(args.autonomy_mode)
     counter_session_reset_steps = max(0, min(int(args.counter_session_reset_steps), 100))
 
     root = args.root.resolve()
     load_dotenv((root / args.env).resolve())
-
-    api_key = require_openai_auth_token(root=root)
-    base_url = os.getenv("OPENAI_BASE_URL", "https://yunwu.ai/v1").strip()
-    chat_model = os.getenv("OPENAI_AGENT_MODEL", os.getenv("OPENAI_CHAT_MODEL", "gpt-5.2")).strip()
-    embed_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small").strip()
 
     target = args.target.strip()
     if not target.startswith(("http://", "https://")):
@@ -613,7 +619,8 @@ def main() -> None:
     run_id = args.run_id.strip() or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     artifact_dir = (root / args.artifact_dir / run_id).resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    dialogue_log_path = (artifact_dir / "codex_dialogue.jsonl").resolve()
+    dialogue_log_path = (artifact_dir / "claude_dialogue.jsonl").resolve()
+    sdk_config = load_claude_sdk_config(root=root, cwd=root)
 
     memory_db_path = (root / args.memory_db).resolve()
     if not args.memory_db.is_absolute() and str(args.memory_db).startswith("logs/"):
@@ -630,23 +637,29 @@ def main() -> None:
     memory.upsert_fact("hint", args.hint, 0.9, 0)
     memory.upsert_fact("counter.session_reset_steps", str(counter_session_reset_steps), 0.9, 0)
     memory.upsert_fact("solver.local_msgchain", "true" if args.local_msgchain else "false", 0.95, 0)
+    memory.upsert_fact("solver.autonomy_mode", args.autonomy_mode, 1.0, 0)
+    memory.upsert_fact(
+        "solver.force_debate",
+        "true" if debate_enabled(args.solver_mode, args.force_debate) else "false",
+        0.95,
+        0,
+    )
     memory.upsert_fact("artifact.dir", str(artifact_dir), 0.95, 0)
     memory.upsert_fact("project.root", str(root), 0.95, 0)
     memory.ensure_flow(target=target, objective=args.objective, hint=args.hint, status="running")
     task_state_id = memory.create_task_state(title=args.objective, step_start=1, status="running")
 
     tools = discover_tools()
-    docs = [] if args.disable_rag else load_index((root / args.index).resolve())
     available_tools = sorted(tools.keys())
     memory.upsert_fact("tools.available", ",".join(available_tools), 0.95, 0)
-    memory.upsert_fact("retrieval.disabled", "true" if args.disable_rag else "false", 0.95, 0)
 
     print(f"[cmd-agent] target={target}")
     print(
-        f"[cmd-agent] run_id={run_id} model={chat_model} "
+        f"[cmd-agent] run_id={run_id} model={sdk_config.model} "
         f"tools={','.join(available_tools) if available_tools else 'none'} "
-        f"docs={len(docs)} retrieval={'off' if args.disable_rag else 'on'} "
-        f"local_msgchain={'on' if args.local_msgchain else 'off'}"
+        f"local_msgchain={'on' if args.local_msgchain else 'off'} "
+        f"autonomy={args.autonomy_mode} "
+        f"debate={'on' if debate_enabled(args.solver_mode, args.force_debate) else 'off'}"
     )
 
     history: list[dict[str, Any]] = []
@@ -659,37 +672,35 @@ def main() -> None:
     current_step = 0
     current_stage = "init"
     current_plan = fallback_plan(memory)
-    response_contexts: dict[str, dict[str, Any]] = empty_response_contexts()
-    if args.resume_response_context:
-        loaded_contexts = load_response_contexts_from_run_state(
+    session_contexts: dict[str, dict[str, Any]] = empty_session_contexts()
+    if args.resume_session_context:
+        loaded_contexts = load_session_contexts_from_run_state(
             latest_run_state_path,
             target=target,
-            base_url=base_url,
-            model=chat_model,
+            sdk_signature=sdk_config.signature(),
         )
         if any(
             bool(
-                ctx.get("previous_response_id", "")
-                or ctx.get("disable_previous_response_id", False)
+                ctx.get("session_id", "")
                 or ctx.get("use_local_msgchain", False)
                 or ctx.get("replay_messages", [])
             )
             for ctx in loaded_contexts.values()
         ):
-            response_contexts = loaded_contexts
-            print(f"[cmd-agent] resumed response contexts from {latest_run_state_path}")
-            memory.add_event(0, "response_context_resume", str(latest_run_state_path))
-    for role in list(response_contexts.keys()):
-        ctx = response_contexts.get(role, {})
+            session_contexts = loaded_contexts
+            print(f"[cmd-agent] resumed Claude SDK sessions from {latest_run_state_path}")
+            memory.add_event(0, "session_context_resume", str(latest_run_state_path))
+    for role in list(session_contexts.keys()):
+        ctx = session_contexts.get(role, {})
         if not isinstance(ctx, dict):
             ctx = {}
         if args.local_msgchain:
             ctx["use_local_msgchain"] = True
         else:
             ctx.pop("use_local_msgchain", None)
-        response_contexts[role] = ctx
-    response_context_seen: dict[str, str] = {}
-    response_context_turns: dict[str, int] = {key: 0 for key in response_contexts.keys()}
+        session_contexts[role] = ctx
+    session_context_seen: dict[str, str] = {}
+    session_context_turns: dict[str, int] = {key: 0 for key in session_contexts.keys()}
     max_tool_calls_per_run = max(1, int(args.max_tool_calls_per_run))
     execution_monitor_same_family_limit = max(1, int(args.execution_monitor_same_family_limit))
     execution_monitor_total_call_limit = max(1, int(args.execution_monitor_total_call_limit))
@@ -727,49 +738,49 @@ def main() -> None:
         append_jsonl(dialogue_log_path, body)
         memory.add_event(step, f"dialogue.{kind}", json.dumps(payload, ensure_ascii=False)[:3000])
 
-    def note_response_context(step: int, role: str) -> None:
-        ctx = response_contexts.get(role, {})
-        rid = str(ctx.get("previous_response_id", "")).strip()
-        if not rid:
+    def note_session_context(step: int, role: str) -> None:
+        ctx = session_contexts.get(role, {})
+        session_id = str(ctx.get("session_id", "")).strip()
+        if not session_id:
             return
-        if response_context_seen.get(role) == rid:
+        if session_context_seen.get(role) == session_id:
             return
-        response_context_turns[role] = int(response_context_turns.get(role, 0)) + 1
-        response_context_seen[role] = rid
-        memory.add_event(step, f"response_context.{role}", rid[:200])
+        session_context_turns[role] = int(session_context_turns.get(role, 0)) + 1
+        session_context_seen[role] = session_id
+        memory.add_event(step, f"session_context.{role}", session_id[:200])
         log_dialogue(
             step,
-            "response_context",
+            "session_context",
             {
                 "role": role,
-                "previous_response_id": rid,
-                "turn": response_context_turns.get(role, 0),
+                "session_id": session_id,
+                "turn": session_context_turns.get(role, 0),
             },
         )
 
-    def maybe_reset_response_context(step: int, role: str, reason: str) -> None:
+    def maybe_reset_session_context(step: int, role: str, reason: str) -> None:
         if role != "counter_solver":
             return
         if counter_session_reset_steps <= 0:
             return
-        turns = int(response_context_turns.get(role, 0))
+        turns = int(session_context_turns.get(role, 0))
         if turns < counter_session_reset_steps:
             return
-        ctx = response_contexts.get(role, {})
-        prev_id = str(ctx.get("previous_response_id", "")).strip()
-        if not prev_id:
+        ctx = session_contexts.get(role, {})
+        session_id = str(ctx.get("session_id", "")).strip()
+        if not session_id:
             return
-        response_contexts[role] = {}
-        response_context_seen.pop(role, None)
-        response_context_turns[role] = 0
+        session_contexts[role] = {}
+        session_context_seen.pop(role, None)
+        session_context_turns[role] = 0
         reset_payload = {
             "role": role,
             "reason": reason,
             "reset_after_turns": turns,
             "reset_every": counter_session_reset_steps,
         }
-        memory.add_event(step, f"response_context_reset.{role}", json.dumps(reset_payload, ensure_ascii=False))
-        log_dialogue(step, "response_context_reset", reset_payload)
+        memory.add_event(step, f"session_context_reset.{role}", json.dumps(reset_payload, ensure_ascii=False))
+        log_dialogue(step, "session_context_reset", reset_payload)
 
     def build_run_obj(*, include_memory: bool = True, partial: bool = True) -> dict[str, Any]:
         return {
@@ -778,8 +789,9 @@ def main() -> None:
             "target": target,
             "objective": args.objective,
             "hint": args.hint,
-            "base_url": base_url,
-            "model": chat_model,
+            "sdk": sdk_config.public_metadata(),
+            "sdk_signature": sdk_config.signature(),
+            "model": sdk_config.model,
             "memory_db": str(memory_db_path),
             "artifact_dir": str(artifact_dir),
             "heartbeat_path": str(heartbeat_path),
@@ -797,8 +809,10 @@ def main() -> None:
             "current_step": current_step,
             "current_stage": current_stage,
             "current_plan": current_plan,
-            "response_contexts": response_contexts,
+            "session_contexts": session_contexts,
             "runtime_controls": {
+                "autonomy_mode": args.autonomy_mode,
+                "force_debate": debate_enabled(args.solver_mode, args.force_debate),
                 "max_tool_calls_per_run": max_tool_calls_per_run,
                 "executed_tool_calls_total": executed_tool_calls_total,
                 "execution_monitor_enabled": bool(args.execution_monitor_enabled),
@@ -884,9 +898,9 @@ def main() -> None:
             node_substep += 1
             current_step = step
             flush_run_state("step_start")
-            is_collab_mode = args.solver_mode == "codex_collab"
-            refresh_interpreter = should_refresh_interpretation(step, memory, history) if args.solver_mode not in {"codex_pure", "codex_collab"} else False
-            if args.solver_mode in {"codex_pure", "codex_collab"}:
+            is_collab_mode = args.solver_mode == "claude_collab"
+            refresh_interpreter = should_refresh_interpretation(step, memory, history) if args.solver_mode not in {"claude_pure", "claude_collab"} else False
+            if args.solver_mode in {"claude_pure", "claude_collab"}:
                 prior = {}
                 controller_reflection = {
                     "phase_override": "",
@@ -915,14 +929,7 @@ def main() -> None:
                         "interpreter",
                         enabled=True,
                         step=step,
-                        base_url=base_url,
-                        api_key=api_key,
-                        model=chat_model,
-                        docs=docs,
-                        top_k=args.top_k,
-                        mode=args.mode,
-                        alpha=args.alpha,
-                        embed_model=embed_model,
+                        sdk_config=sdk_config,
                         target=target,
                         objective=args.objective,
                         hint=args.hint,
@@ -934,9 +941,7 @@ def main() -> None:
                 reflector_job_id = orchestrator.submit(
                     "reflector",
                     step=step,
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=chat_model,
+                    sdk_config=sdk_config,
                     target=target,
                     objective=args.objective,
                     expected_phase=expected_phase_local,
@@ -959,14 +964,7 @@ def main() -> None:
                     prior = run_interpreter_worker(
                         enabled=refresh_interpreter,
                         step=step,
-                        base_url=base_url,
-                        api_key=api_key,
-                        model=chat_model,
-                        docs=docs,
-                        top_k=args.top_k,
-                        mode=args.mode,
-                        alpha=args.alpha,
-                        embed_model=embed_model,
+                        sdk_config=sdk_config,
                         target=target,
                         objective=args.objective,
                         hint=args.hint,
@@ -976,9 +974,7 @@ def main() -> None:
                     )
                     controller_reflection = run_reflector_worker(
                         step=step,
-                        base_url=base_url,
-                        api_key=api_key,
-                        model=chat_model,
+                        sdk_config=sdk_config,
                         target=target,
                         objective=args.objective,
                         expected_phase=expected_phase_local,
@@ -994,14 +990,7 @@ def main() -> None:
                 prior = run_interpreter_worker(
                     enabled=refresh_interpreter,
                     step=step,
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=chat_model,
-                    docs=docs,
-                    top_k=args.top_k,
-                    mode=args.mode,
-                    alpha=args.alpha,
-                    embed_model=embed_model,
+                    sdk_config=sdk_config,
                     target=target,
                     objective=args.objective,
                     hint=args.hint,
@@ -1012,9 +1001,7 @@ def main() -> None:
                 current_stage = "reflector_sync"
                 controller_reflection = run_reflector_worker(
                     step=step,
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=chat_model,
+                    sdk_config=sdk_config,
                     target=target,
                     objective=args.objective,
                     expected_phase=derive_phase_state(memory, history)[0],
@@ -1044,30 +1031,6 @@ def main() -> None:
             if refresh_interpreter:
                 print(f"[step {step}] interpreter primary={','.join(prior.get('primary_hypotheses', [])[:3]) or 'none'} family={prior.get('challenge_family', 'unknown')}")
 
-            retrieval_query = (
-                f"{args.objective}\n{args.hint}\n"
-                f"task_prior:\n{task_prior_summary(memory)}\n"
-                f"history:\n{short_history(history)}"
-            )
-            try:
-                current_stage = "retrieval"
-                hits = hybrid_retrieve(
-                    query=retrieval_query,
-                    docs=docs,
-                    top_k=args.top_k,
-                    mode=args.mode,
-                    alpha=args.alpha,
-                    base_url=base_url,
-                    api_key=api_key,
-                    embed_model=embed_model,
-                ) if docs else []
-            except Exception as exc:
-                print(f"[warn] retrieval degraded: {exc}")
-                hits = []
-
-            context = "\n\n".join(
-                [f"[score={h['score']:.4f}] {h['path']}#chunk{h['chunk_index']}\n{h['text'][:700]}" for h in hits]
-            ) or "no retrieval context"
             memory_summary = memory.summary(max_items=30)
             prior_summary = task_prior_summary(memory, max_items=20)
             endpoints_text = endpoint_summary(memory, max_items=10)
@@ -1078,18 +1041,27 @@ def main() -> None:
             expected_phase, constraints = derive_phase_state(memory, history)
             repeat_guard = pathological_repeat_summary(history, memory)
             repeat_guard_text = repeat_guard_summary_text(repeat_guard)
+            if args.autonomy_mode == "adaptive" and repeat_guard.get("active"):
+                repeat_guard_text = (
+                    "Repeat-avoidance suggestion (advisory; runtime evidence may justify continuing):\n"
+                    + repeat_guard_text.replace("Repeat guard", "Repeat suggestion")
+                )
             memory.upsert_fact("repeat_guard.active", "true" if repeat_guard.get("active") else "false", 0.96, step)
             memory.upsert_fact("repeat_guard.reason", str(repeat_guard.get("reason", ""))[:120], 0.93, step)
             memory.upsert_fact("repeat_guard.family", str(repeat_guard.get("repeated_family", ""))[:120], 0.92, step)
             memory.upsert_fact("repeat_guard.surface", str(repeat_guard.get("repeated_surface", ""))[:180], 0.92, step)
             if repeat_guard.get("active"):
+                repeat_label = "Repeat suggestion" if args.autonomy_mode == "adaptive" else "Repeat guard"
                 for item in repeat_guard.get("requirements", [])[:3]:
-                    constraints.append(f"Repeat guard: {item}")
+                    constraints.append(f"{repeat_label}: {item}")
                 memory.add_event(step, "repeat_guard", json.dumps(repeat_guard, ensure_ascii=False)[:3000])
             # Rebind expected phase based on latest local derivation and reflector override.
             phase_override = str(controller_reflection.get("phase_override", "")).strip().lower()
             if phase_override in {"recon", "probe", "exploit", "extract", "verify"}:
-                expected_phase = phase_override
+                if args.autonomy_mode == "guarded":
+                    expected_phase = phase_override
+                else:
+                    constraints.append(f"Controller phase suggestion: consider `{phase_override}`.")
             controller_do = [str(item).strip() for item in controller_reflection.get("must_do", []) if str(item).strip()]
             controller_avoid = [str(item).strip() for item in controller_reflection.get("must_avoid", []) if str(item).strip()]
             controller_allowed_families = [
@@ -1097,13 +1069,15 @@ def main() -> None:
                 for item in controller_reflection.get("allowed_families", [])
                 if str(item).strip()
             ]
+            controller_do_label = "Controller advice" if args.autonomy_mode == "adaptive" else "Controller must-do"
+            controller_avoid_label = "Controller caution" if args.autonomy_mode == "adaptive" else "Controller avoid"
             for item in controller_do[:3]:
-                constraints.append(f"Controller must-do: {item}")
+                constraints.append(f"{controller_do_label}: {item}")
             for item in controller_avoid[:3]:
-                constraints.append(f"Controller avoid: {item}")
+                constraints.append(f"{controller_avoid_label}: {item}")
             if controller_allowed_families:
                 constraints.append(
-                    "Controller allowed families: "
+                    ("Controller family suggestion: " if args.autonomy_mode == "adaptive" else "Controller allowed families: ")
                     + summarize_allowed_families(controller_allowed_families)
                 )
             memory.upsert_fact(
@@ -1143,7 +1117,14 @@ def main() -> None:
             constraint_text = "\n".join(f"- {item}" for item in constraints) if constraints else "- none"
             gain_requirements = gain_policy.get("requirements", {}) if isinstance(gain_policy.get("requirements"), dict) else {}
             monitor_requirements = monitor_policy.get("requirements", {}) if isinstance(monitor_policy.get("requirements"), dict) else {}
-            if bool(gain_requirements.get("force_branch_shift", False) or monitor_requirements.get("force_branch_shift", False)):
+            branch_shift_level = branch_shift_enforcement(
+                args.autonomy_mode,
+                gain_policy,
+                monitor_policy,
+            )
+            hard_branch_shift_requested = branch_shift_level == "hard"
+            soft_branch_shift_requested = branch_shift_level == "advisory"
+            if hard_branch_shift_requested:
                 candidate_family = str(monitor_last_family).strip()
                 if not candidate_family:
                     candidate_family = str(gain_policy.get("summary", {}).get("last_family", "")).strip()
@@ -1191,8 +1172,36 @@ def main() -> None:
                             "force_branch_shift_candidates",
                             branch_shift_candidates_text(forced_branch_shift_candidates)[:3000],
                         )
-            if bool(gain_requirements.get("force_plan_refresh", False) or monitor_requirements.get("force_plan_refresh", False)):
-                current_plan = {"rationale": "forced_replan_by_policy", "subtasks": []}
+            elif soft_branch_shift_requested:
+                advisory = {
+                    "gain_severity": str(gain_policy.get("severity", "none")),
+                    "monitor_severity": str(monitor_policy.get("severity", "none")),
+                    "last_family": str(monitor_last_family or gain_policy.get("summary", {}).get("last_family", "")),
+                    "suggestion": "consider changing command family or evidence surface",
+                }
+                memory.add_event(
+                    step,
+                    "branch_shift_advisory",
+                    json.dumps(advisory, ensure_ascii=False)[:3000],
+                )
+                constraints.append(
+                    "Branch-shift suggestion: consider a different command family or evidence surface; "
+                    "this is advisory unless a hard policy breach is present."
+                )
+            force_plan_refresh = bool(
+                gain_requirements.get("force_plan_refresh", False)
+                or monitor_requirements.get("force_plan_refresh", False)
+                or soft_branch_shift_requested
+            )
+            if force_plan_refresh:
+                current_plan = {
+                    "rationale": (
+                        "forced_replan_by_policy"
+                        if hard_branch_shift_requested or args.autonomy_mode == "guarded"
+                        else "advisory_replan_by_policy"
+                    ),
+                    "subtasks": [],
+                }
                 persist_plan(memory, current_plan, step)
                 monitor_total_calls_since_replan = 0
                 monitor_same_family_streak = 0
@@ -1200,12 +1209,11 @@ def main() -> None:
                 if not controller_reflection.get("allowed_families"):
                     forced_branch_shift_allowed_families = []
                     forced_branch_shift_candidates = []
+            constraint_text = "\n".join(f"- {item}" for item in constraints) if constraints else "- none"
             if (refresh_interpreter or not current_subtask(current_plan)) and not is_collab_mode:
                 current_stage = "planning"
                 current_plan = run_plan_worker(
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=chat_model,
+                    sdk_config=sdk_config,
                     target=target,
                     objective=args.objective,
                     hint=args.hint,
@@ -1219,9 +1227,9 @@ def main() -> None:
                     history_text=short_history(history),
                     recent_obs=recent_observations(history),
                     memory=memory,
-                    response_context=response_contexts["planner"],
+                    session_context=session_contexts["planner"],
                 )
-                note_response_context(step, "planner")
+                note_session_context(step, "planner")
                 persist_plan(memory, current_plan, step)
                 memory.add_event(step, "plan_refresh", json.dumps(current_plan, ensure_ascii=False)[:3000])
                 flush_run_state("post_plan")
@@ -1243,10 +1251,23 @@ def main() -> None:
             recommender_plan: dict[str, Any] = {}
             corrector_review: dict[str, Any] = {}
             counter_solver_notes: dict[str, Any] = {}
-            if args.solver_mode in {"codex", "codex_pure", "codex_collab"}:
-                force_debate = _debate_enabled_default_true()
+            if args.solver_mode in {"claude", "claude_pure", "claude_collab"}:
+                force_debate = debate_enabled(args.solver_mode, args.force_debate)
+                effective_allowed_families = (
+                    forced_branch_shift_allowed_families
+                    or (controller_allowed_families if args.autonomy_mode == "guarded" else [])
+                )
                 allowed_family_text = summarize_allowed_families(
-                    forced_branch_shift_allowed_families or controller_allowed_families
+                    effective_allowed_families
+                )
+                family_guidance_label = (
+                    "Allowed families after hard branch shift"
+                    if forced_branch_shift_allowed_families
+                    else (
+                        "Controller allowed families"
+                        if args.autonomy_mode == "guarded"
+                        else "Controller family suggestions"
+                    )
                 )
                 branch_shift_candidate_text = branch_shift_candidates_text(forced_branch_shift_candidates)
                 planner_context_text = (
@@ -1254,7 +1275,7 @@ def main() -> None:
                     f"Current plan summary:\n{plan_summary(current_plan)}\n\n"
                     f"Endpoint candidates:\n{endpoints_text}\n\n"
                     f"Comment hints:\n{hints_text}\n\n"
-                    f"Allowed families after branch shift: {allowed_family_text}\n\n"
+                    f"{family_guidance_label}: {allowed_family_text}\n\n"
                     f"Branch-shift candidate set:\n{branch_shift_candidate_text}\n\n"
                     f"{repeat_guard_text}\n"
                 )
@@ -1264,14 +1285,14 @@ def main() -> None:
                 )
                 reflector_notes_text = (
                     f"Controller rationale: {str(controller_reflection.get('rationale', '')).strip() or 'none'}\n"
-                    f"Allowed families after branch shift: {allowed_family_text}\n"
+                    f"{family_guidance_label}: {allowed_family_text}\n"
                     f"Branch-shift candidate set:\n{branch_shift_candidate_text}\n"
                     f"Recent reflection summary:\n{reflect_summary}\n\n"
                     f"{repeat_guard_text}\n\n"
                     f"Soft notes from reflector:\n"
                     + ("\n".join(f"- {item}" for item in (controller_do + controller_avoid)[:6]) if (controller_do or controller_avoid) else "- none")
                 )
-                if args.solver_mode in {"codex_pure", "codex_collab"}:
+                if args.solver_mode in {"claude_pure", "claude_collab"}:
                     planner_context_text = (
                         f"{args.solver_mode} mode: planner/interpreter/reflector are advisory only. Prioritize runtime evidence.\n\n"
                         f"{repeat_guard_text}"
@@ -1282,11 +1303,9 @@ def main() -> None:
                         f"{repeat_guard_text}"
                     )
                 if force_debate:
-                    maybe_reset_response_context(step, "counter_solver", "periodic_turn_limit")
+                    maybe_reset_session_context(step, "counter_solver", "periodic_turn_limit")
                     counter_solver_notes = run_counter_solver(
-                        base_url=base_url,
-                        api_key=api_key,
-                        model=chat_model,
+                        sdk_config=sdk_config,
                         target=target,
                         objective=args.objective,
                         step=step,
@@ -1296,15 +1315,12 @@ def main() -> None:
                         hypotheses_text=hypo_summary,
                         recent_history=short_history(history),
                         recent_obs=recent_observations(history),
-                        retrieved_context=context,
-                        response_context=response_contexts["counter_solver"],
+                        session_context=session_contexts["counter_solver"],
                         trace_hook=(lambda payload: log_dialogue(step, str(payload.get("kind", "counter")), payload)),
                     )
-                    note_response_context(step, "counter_solver")
+                    note_session_context(step, "counter_solver")
                 plan, judge = run_tactical_solver(
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=chat_model,
+                    sdk_config=sdk_config,
                     target=target,
                     objective=args.objective,
                     step=step,
@@ -1328,18 +1344,15 @@ def main() -> None:
                     actions_text=actions_text,
                     recent_history=short_history(history),
                     recent_obs=recent_observations(history),
-                    retrieved_context=context,
                     counter_solver_notes=counter_solver_notes,
                     collab_mode=is_collab_mode,
-                    response_context=response_contexts["tactical_solver"],
+                    session_context=session_contexts["tactical_solver"],
                     trace_hook=(lambda payload: log_dialogue(step, str(payload.get("kind", "tactical")), payload)),
                 )
-                note_response_context(step, "tactical_solver")
+                note_session_context(step, "tactical_solver")
                 if force_debate:
                     corrector_review = run_corrector(
-                        base_url=base_url,
-                        api_key=api_key,
-                        model=chat_model,
+                        sdk_config=sdk_config,
                         target=target,
                         step=step,
                         active_title=active_title,
@@ -1352,22 +1365,33 @@ def main() -> None:
                         memory_summary=memory_summary,
                         recent_history=short_history(history),
                         counter_solver_notes=counter_solver_notes,
-                        response_context=response_contexts["corrector"],
+                        session_context=session_contexts["corrector"],
                     )
-                    note_response_context(step, "corrector")
+                    note_session_context(step, "corrector")
                     plan, judge = choose_final_proposal(
                         recommender=plan,
                         corrector=corrector_review,
                         active_action=active_action,
                         counter_solver=counter_solver_notes,
+                        enforce_planner_action=(args.autonomy_mode == "guarded"),
                     )
             else:
+                planner_guidance = (
+                    "A planner suggested the current subtask. Treat it as advice and follow stronger runtime evidence when useful."
+                    if args.autonomy_mode == "adaptive"
+                    else "A planner has selected the current subtask. Execute that subtask rather than improvising a brand-new route."
+                )
+                policy_guidance = (
+                    "Use persistent memory, hypotheses, and reflection as advisory context; runtime evidence may justify a different route."
+                    if args.autonomy_mode == "adaptive"
+                    else "Use persistent memory facts, hypotheses, and reflection constraints as hard constraints."
+                )
                 planner_prompt = (
-                    "You are a Codex-style CTF command agent.\n"
-                    "A planner has already selected the current subtask. Execute that subtask rather than improvising a brand-new route.\n"
+                    "You are a Claude-powered CTF command agent.\n"
+                    f"{planner_guidance}\n"
                     "A separate interpreter has already produced task priors. Treat those priors as strong guidance unless runtime evidence is overwhelming.\n"
                     "Output one concrete shell command per step, then iterate from observed output.\n"
-                    "Use persistent memory facts, hypotheses, and reflection constraints as hard constraints.\n"
+                    f"{policy_guidance}\n"
                     "Treat the current subtask as the primary objective for this step.\n"
                     "Minimize recon once actionable entrypoints exist. Prefer commands with the highest expected information gain.\n"
                     "Only treat actual request inputs as attack surfaces: query parameters, form input names, headers, cookies, request bodies, or confirmed API fields.\n"
@@ -1419,22 +1443,17 @@ def main() -> None:
                     f"Reflection constraints:\n{reflect_summary}\n\n"
                     f"Controller reflection:\n{json.dumps(controller_reflection, ensure_ascii=False)}\n\n"
                     f"Recent history:\n{short_history(history)}\n\n"
-                    f"Recent observations:\n{recent_observations(history)}\n\n"
-                    f"Retrieved context:\n{context}\n"
+                    f"Recent observations:\n{recent_observations(history)}\n"
                 )
                 recommender_plan = run_recommender(
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=chat_model,
+                    sdk_config=sdk_config,
                     system_prompt=planner_prompt,
                     user_prompt=user_prompt,
-                    response_context=response_contexts["recommender"],
+                    session_context=session_contexts["recommender"],
                 )
-                note_response_context(step, "recommender")
+                note_session_context(step, "recommender")
                 corrector_review = run_corrector(
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=chat_model,
+                    sdk_config=sdk_config,
                     target=target,
                     step=step,
                     active_title=active_title,
@@ -1446,13 +1465,14 @@ def main() -> None:
                     available_actions_text=actions_text,
                     memory_summary=memory_summary,
                     recent_history=short_history(history),
-                    response_context=response_contexts["corrector"],
+                    session_context=session_contexts["corrector"],
                 )
-                note_response_context(step, "corrector")
+                note_session_context(step, "corrector")
                 plan, judge = choose_final_proposal(
                     recommender=recommender_plan,
                     corrector=corrector_review,
                     active_action=active_action,
+                    enforce_planner_action=(args.autonomy_mode == "guarded"),
                 )
             flush_run_state("post_decision")
             capability = resolve_capability_gap(
@@ -1463,9 +1483,7 @@ def main() -> None:
                 artifact_dir=artifact_dir,
             )
             logistics_decision = run_logistics_decider(
-                base_url=base_url,
-                api_key=api_key,
-                model=chat_model,
+                sdk_config=sdk_config,
                 capability=capability,
                 available_tools=tools,
                 memory_summary=memory_summary,
@@ -1754,19 +1772,46 @@ def main() -> None:
                 branch_shift_block_family = ""
                 validator_policy = (
                     {}
-                    if args.solver_mode == "codex_pure"
-                    else (controller_reflection if args.solver_mode == "legacy" else soften_controller_for_codex(controller_reflection))
+                    if args.solver_mode == "claude_pure"
+                    else (controller_reflection if args.solver_mode == "legacy" else soften_controller_for_claude(controller_reflection))
                 )
-                ok, reason = validate_action(
-                phase=phase,
-                expected_phase=expected_phase,
-                command=cmd,
+                policy_decision = evaluate_action_policy(
+                    phase=phase,
+                    expected_phase=expected_phase,
+                    command=cmd,
                     memory=memory,
                     history=history,
                     controller_reflection=validator_policy,
                     action_name=active_action_name,
+                    autonomy_mode=args.autonomy_mode,
                 )
-                if not ok:
+                policy_ok = bool(policy_decision.get("ok", True))
+                reason = str(policy_decision.get("reason", "")).strip()
+                advisories = [
+                    str(item).strip()
+                    for item in policy_decision.get("advisories", [])
+                    if str(item).strip()
+                ] if isinstance(policy_decision.get("advisories", []), list) else []
+                if args.autonomy_mode == "adaptive":
+                    if not policy_ok and reason:
+                        advisories.insert(0, reason)
+                    if advisories:
+                        memory.add_event(
+                            step,
+                            "action_policy_advisory",
+                            json.dumps(
+                                {
+                                    "command": cmd[:500],
+                                    "phase": phase,
+                                    "expected_phase": expected_phase,
+                                    "advisories": advisories[:8],
+                                },
+                                ensure_ascii=False,
+                            )[:3000],
+                        )
+                        print(f"[step {step}] action-policy advisory: {' | '.join(advisories[:3])}")
+                    policy_ok = True
+                if not policy_ok:
                     history.append(
                     {
                         "step": step,
@@ -2014,16 +2059,14 @@ def main() -> None:
 
     if not final_report:
         final_report = summarize_run(
-            base_url=base_url,
-            api_key=api_key,
-            model=chat_model,
+            sdk_config=sdk_config,
             target=target,
             objective=args.objective,
             history=history,
             found_flag=found_flag,
-            response_context=response_contexts["summary"],
+            session_context=session_contexts["summary"],
         )
-        note_response_context(max(1, len(history)), "summary")
+        note_session_context(max(1, len(history)), "summary")
 
     run_success = bool(found_flag)
     memory.set_task_state_status(

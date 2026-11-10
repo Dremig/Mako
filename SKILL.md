@@ -7,7 +7,18 @@ description: Use when working inside this repository on the Mako CTF agent loop,
 
 Use this skill when editing or debugging the local CTF agent runtime in this repository.
 
-## Core rules
+## Runtime routing
+
+- `scripts/run_web_agent.sh` defaults to `web_agent.pure_sdk_agent`.
+- Pure mode is one unrestricted Claude Agent SDK loop with a shared resumable session. Mako does not own its plan, tool calls, phases, or completion decision.
+- `scripts/followup.sh` sends inspect/resume/fork messages directly to recorded SDK sessions; it must not translate them into planner tasks.
+- `web_agent/session_ledger.py` may store topology and runtime receipts, but must never become a facts/claims/intents authority.
+- `web_agent/artifact_workspace.py` may preserve immutable bytes and provenance receipts, but must never infer claims, score routes, or inject artifact content into prompts automatically.
+- Artifact retrieval is model-pull: Claude may use `artifact_capture`, `artifact_list`, and `artifact_peek` when useful.
+- `MAKO_RUNTIME_MODE=governed` selects the older interpreter/planner/validator runtime in `web_agent.cmd_agent`.
+- Apply the control rules below only to governed mode. For pure mode, debug SDK configuration, session continuity, Claude settings/MCP/tool discovery, and the target environment without reintroducing Mako policy gates.
+
+## Governed-runtime rules
 
 1. `done` means challenge completion, not subtask completion.
 - Never treat "homepage fetched", "baseline stable", or "one subtask finished" as challenge solved.
@@ -102,14 +113,15 @@ When a run looks bad, classify it quickly:
 
 ## Preferred fixes
 
-1. Tighten runtime guards before changing prompts.
-2. Keep changes local and testable in:
+1. Preserve the pure SDK boundary: do not add planner, validator, tool hooks, turn caps, or command interception to `pure_sdk_agent.py`.
+2. For governed-mode failures, tighten hard runtime invariants before changing prompts.
+3. Keep governed changes local and testable in:
 - `web_agent/cmd_agent.py`
 - `web_agent/solver_shared.py`
 - `web_agent/deliberation.py`
 - `web_agent/planner.py`
 
-3. After behavior changes, run targeted regressions first.
+4. After behavior changes, run targeted regressions first.
 - Compile touched Python files.
 - Run focused tests for deliberation/policy/structured actions.
 - Then rerun a small benchmark slice before a full batch.
@@ -122,6 +134,6 @@ For this repo, the main failure modes are usually:
 - planner/runtime mismatch, not lack of prompts alone
 
 Default stance:
-- fix control semantics first
+- pure mode: trust the SDK loop and preserve shared context
+- governed mode: fix control semantics first
 - then rerun representative benchmark cases
-- only then adjust timeout budgets

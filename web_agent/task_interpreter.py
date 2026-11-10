@@ -4,9 +4,13 @@ import json
 import re
 from typing import Any
 
-from rag.agent import hybrid_retrieve, short_history
-from rag.common import json_completion
-from web_agent.solver_shared import MemoryStore, recent_observations, task_prior_map
+from web_agent.claude_runtime import ClaudeSDKConfig, json_completion
+from web_agent.solver_shared import (
+    MemoryStore,
+    recent_observations,
+    short_history,
+    task_prior_map,
+)
 
 
 STRICT_JSON_RULES = (
@@ -204,14 +208,7 @@ def should_refresh_interpretation(step: int, memory: MemoryStore, history: list[
 def run_task_interpreter(
     *,
     step: int,
-    base_url: str,
-    api_key: str,
-    model: str,
-    docs: list[dict[str, Any]],
-    top_k: int,
-    mode: str,
-    alpha: float,
-    embed_model: str,
+    sdk_config: ClaudeSDKConfig,
     target: str,
     objective: str,
     hint: str,
@@ -221,23 +218,7 @@ def run_task_interpreter(
 ) -> dict[str, Any]:
     observation_text = recent_observations(history, limit=6)
     heuristic = heuristic_prior(objective, hint, observation_text)
-    retrieval_query = f"task interpretation\n{objective}\n{hint}\n{short_history(history)}"
-    try:
-        hits = hybrid_retrieve(
-            query=retrieval_query,
-            docs=docs,
-            top_k=max(4, min(8, top_k)),
-            mode=mode,
-            alpha=alpha,
-            base_url=base_url,
-            api_key=api_key,
-            embed_model=embed_model,
-        ) if docs else []
-    except Exception:
-        hits = []
-    context = "\n\n".join(
-        [f"[score={h['score']:.4f}] {h['path']}#chunk{h['chunk_index']}\n{h['text'][:500]}" for h in hits[:6]]
-    ) or "no retrieval context"
+    history_text = short_history(history)
 
     planner_prompt = (
         "You are a task interpreter for a blackbox CTF solving system.\n"
@@ -264,7 +245,7 @@ def run_task_interpreter(
         f"Available tools: {json.dumps(available_tools, ensure_ascii=False)}\n"
         f"Existing task prior: {json.dumps(task_prior_map(memory), ensure_ascii=False)}\n"
         f"Recent observations:\n{observation_text}\n\n"
-        f"Retrieved context:\n{context}\n\n"
+        f"Recent history:\n{history_text}\n\n"
         f"Heuristic prior:\n{json.dumps(heuristic, ensure_ascii=False)}\n"
     )
     try:
@@ -272,9 +253,7 @@ def run_task_interpreter(
         for attempt in range(1, 4):
             try:
                 prior = json_completion(
-                    base_url=base_url,
-                    api_key=api_key,
-                    model=model,
+                    config=sdk_config,
                     system_prompt=planner_prompt,
                     user_prompt=user_prompt,
                     json_schema_name="task_interpreter",

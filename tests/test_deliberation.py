@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from web_agent.deliberation import choose_final_proposal, force_planner_action_hint, run_counter_solver
 
@@ -58,6 +59,29 @@ class DeliberationTests(unittest.TestCase):
         self.assertEqual(final["action"]["name"], "service_recovery_probe")
         self.assertEqual(judge["decision"], "force_planner_action")
 
+    def test_choose_final_proposal_keeps_model_command_when_planner_action_is_advisory(self) -> None:
+        recommender = {
+            "analysis": "Probe the confirmed login form before service recovery.",
+            "decision": "command",
+            "phase": "probe",
+            "command": "curl -si -X POST $TARGET_URL/login -d 'user=test'",
+            "action": {},
+            "success_signal": "login response differs from baseline",
+            "next_if_fail": "curl -si $TARGET_URL/",
+        }
+        corrector = {"verdict": "accept", "issues": [], "corrected": recommender}
+        final, judge = choose_final_proposal(
+            recommender=recommender,
+            corrector=corrector,
+            active_action="service_recovery_probe",
+            enforce_planner_action=False,
+        )
+        self.assertEqual(final["decision"], "command")
+        self.assertEqual(final["command"], recommender["command"])
+        self.assertEqual(final["action"], {})
+        self.assertEqual(judge["decision"], "accept_recommender")
+        self.assertIn("adaptive autonomy", judge["reason"])
+
     def test_force_planner_action_hint_keeps_existing_action(self) -> None:
         chosen = {
             "analysis": "Use the planner-provided action directly.",
@@ -77,22 +101,20 @@ class DeliberationTests(unittest.TestCase):
         self.assertEqual(judge["decision"], "accept_tactical")
 
     def test_run_counter_solver_returns_stable_shape_on_failure(self) -> None:
-        result = run_counter_solver(
-            base_url="http://127.0.0.1:9/v1",
-            api_key="x",
-            model="gpt-5.4",
-            target="http://target.local/",
-            objective="obj",
-            step=1,
-            expected_phase="probe",
-            current_plan_text="none",
-            memory_summary="none",
-            hypotheses_text="none",
-            recent_history="none",
-            recent_obs="none",
-            retrieved_context="none",
-            trace_hook=None,
-        )
+        with patch("web_agent.deliberation._run_json_model", return_value={"_error": "fixture"}):
+            result = run_counter_solver(
+                sdk_config=object(),
+                target="http://target.local/",
+                objective="obj",
+                step=1,
+                expected_phase="probe",
+                current_plan_text="none",
+                memory_summary="none",
+                hypotheses_text="none",
+                recent_history="none",
+                recent_obs="none",
+                trace_hook=None,
+            )
         self.assertIn("main_hypothesis", result)
         self.assertIn("counter_hypothesis", result)
         self.assertIn("evidence_for", result)

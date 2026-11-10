@@ -21,30 +21,30 @@ This file is reserved for PentAGI-driven design input and integration notes.
 ### Runtime architecture now in repo
 - `task_interpreter.py`: priors and opener bias
 - `planner.py`: explicit subtasks and plan patch application
-- `deliberation.py`: tactical action selection (`codex tactical solver` by default, legacy recommender/corrector/judge retained as fallback)
+- `deliberation.py`: tactical action selection (`claude tactical solver` by default, legacy recommender/corrector/judge retained as fallback)
 - `capability.py`: decide whether to reuse, write helper, install, or replan
 - `logistics.py`: perform support work outside challenge-step accounting
 - `reflector.py`: policy reflection that constrains and patches planning
-- `solver_shared.py`: runtime memory, validators, structured actions, execution reflection
+- `solver_shared.py`: runtime memory, autonomy policy, structured actions, execution reflection
 
 ### Current responsibility split
 - `interpreter + planner`: produce route hypotheses, summaries, and discussion context for the current subtask
-- `codex tactical solver`: is the primary local solver and owns the concrete method for the current subtask (`command` / structured `action` / helper-first move)
-- `runtime guard`: owns preflight, validator, execution, artifact persistence, and final validation
+- `claude tactical solver`: is the primary local solver and owns the concrete method for the current subtask (`command` / structured `action` / helper-first move)
+- `runtime guard`: owns hard preflight, budgets, execution, artifact persistence, and final validation
 
-This is intentionally closer to the common human + Codex CTF workflow:
+This is intentionally closer to a human + Claude CTF workflow:
 - semantic reasoning stays outside the command loop as advisory context
-- the concrete next move is delegated to Codex
+- the concrete next move is delegated to Claude
 
 ### Advisory-not-command rule
 - planner/interpreter/reflector should discuss, not command
 - their outputs are useful because they summarize and hypothesize
-- they should not suppress Codex's local judgment with overly hard subtask constraints
+- they should not suppress Claude's local judgment with overly hard subtask constraints
 
 Operationally, this means:
 - planner suggestions are treated as `discussion cards`
-- Codex may agree, adapt, or reject local hints
-- runtime validation in Codex mode should keep only hard safety/budget bottoms, not semantic over-control
+- Claude may agree, adapt, or reject local hints
+- runtime validation in Claude mode should keep only hard safety/budget bottoms, not semantic over-control
 
 ### Structured actions expanded
 - `http_probe_with_baseline`
@@ -134,9 +134,9 @@ Result records:
 2. Track per-run counters: `error rate`, `timeout rate`, `invalid command block count`, `autofix count`, `steps to first actionable exploit`.
 3. Add one more low-complexity Web case (`2021q-web-gatekeeping`) to reduce single-target bias.
 
-## Convergence diagnosis: taxonomy-to-control gap
+## Convergence diagnosis: taxonomy-to-autonomy gap
 
-We already have rich error taxonomy in memory, but slow convergence shows the taxonomy is not yet acting as a hard control loop.
+We already have rich error taxonomy in memory, but slow convergence shows the taxonomy must improve decisions without replacing the tactical solver's judgment.
 
 ### Why convergence is still slow even with good classification coverage
 1. Late trigger:
@@ -144,26 +144,26 @@ We already have rich error taxonomy in memory, but slow convergence shows the ta
 2. Weak action mapping:
    - Error labels are descriptive, but not always mapped to deterministic next actions.
    - Example target behavior should be explicit: `service_unready -> readiness macro`, `validation_block -> command rewrite macro`.
-3. Soft constraints only:
-   - Labels are written to memory but often treated as hints; planner/solver can still pick near-identical low-yield actions.
+3. Uncalibrated constraints:
+   - Treating every label as a hint permits cheap loops, while treating every label as a hard gate suppresses evidence-backed exploration.
 4. No budget coupling:
    - Error types are not consistently tied to retry caps, per-step timeout, or forced phase transition thresholds.
 
-### Design target: state-transition contract
-Use error taxonomy as a strict transition table, not only reflection metadata.
+### Design target: evidence-governed autonomy
+Use error taxonomy as graded advice with a hard circuit breaker only for measurable budget, safety, completion, and sustained zero-gain conditions.
 
-`(error_type, phase) -> {next_phase, allowed_actions, must_do, must_avoid, timeout_sec, retry_cap}`
+`(error_type, phase) -> {suggested_phase, suggested_actions, cautions, timeout_sec, retry_cap, severity}`
 
-This contract should be enforced before next action selection so repeated low-gain loops are cut off early.
+`adaptive` keeps semantic fields advisory; `guarded` may enforce them. A `hard` severity remains enforceable in either mode.
 
 ### Minimum implementation checklist
 1. Add a transition registry in solver shared policy:
    - canonical key: `(failure_cluster, current_phase)`.
-2. On each failed/low-gain step, resolve transition first, then gate planner/deliberation choices.
-3. Enforce hard `retry_cap` per `(cluster, subtask)` pair.
+2. On each failed/low-gain step, resolve transition and show it to the tactical solver before selection.
+3. Enforce `retry_cap` only when the measured failure cluster reaches hard severity.
 4. Enforce dynamic timeout policy:
    - infra/transient failures use shorter command timeout + quick retry.
-   - strategy failures force branch shift instead of same-action retry.
+   - strategy failures suggest branch shifts; sustained zero-gain failures force them.
 5. Add low-gain circuit breaker:
    - `N` consecutive `info_gain == 0` triggers mandatory branch switch/replan.
 
